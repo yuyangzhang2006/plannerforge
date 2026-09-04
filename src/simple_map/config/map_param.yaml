@@ -1,0 +1,9 @@
+/**:
+  ros__parameters:
+    cloud_bridge:
+      image_filename: "RMUC2026.png"
+      obstacle_gray_threshold: 128
+      map_bounds_m: [-14.1, 0.0, -7.6, 0.0, -2.0, 2.0]
+      image_origin_m: [-14.11, -7.61]
+      image_resolution_m_per_pixel: 0.05
+      map_resolution_m_per_cell: 0.05

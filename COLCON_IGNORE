@@ -1,0 +1,2 @@
+# 防止从父目录执行 colcon build 时重复发现同名 gcopter 包。
+# 在 PlannerForge 中使用 colcon build --base-paths src 单独构建。
