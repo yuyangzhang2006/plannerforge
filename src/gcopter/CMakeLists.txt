@@ -22,6 +22,7 @@ find_package(Eigen3 REQUIRED)
 # 搜索、采样和轨迹生成。
 add_library(gcopter_core
   src/path_search.cpp
+  src/local_replan.cpp
   src/corridor_generator.cpp
   src/trajectory_generation.cpp)
 target_include_directories(gcopter_core PUBLIC

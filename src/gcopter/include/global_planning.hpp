@@ -2,6 +2,7 @@
 
 #include "gcopter/corridor_generator.hpp"
 #include "gcopter/grid_map_2d.hpp"
+#include "gcopter/local_replan.hpp"
 #include "gcopter/path_search.hpp"
 #include "gcopter/traj_representation.hpp"
 #include "gcopter/trajectory.hpp"
@@ -46,6 +47,7 @@ struct Config
   double replan_cooldown_ms = 500.0;
   double planning_retry_interval_ms = 1000.0;
   int planning_retry_limit = 20;
+  LocalReplanOptions local_replan;
   std::vector<double> cross_hole_regions;  // xmin, xmax, ymin, ymax tuples
   PathSearch::Options search;
   CorridorOptions corridor;
@@ -87,6 +89,10 @@ struct Config
     node->declare_parameter("gcopter.ReplanCooldownMs", 500.0);
     node->declare_parameter("gcopter.PlanningRetryIntervalMs", 1000.0);
     node->declare_parameter("gcopter.PlanningRetryLimit", 20);
+    node->declare_parameter("gcopter.LocalReplanMinLookaheadDistance", 1.5);
+    node->declare_parameter("gcopter.LocalReplanMaxLookaheadDistance", 6.0);
+    node->declare_parameter("gcopter.LocalReplanMaxPathDistance", 9.0);
+    node->declare_parameter("gcopter.LocalReplanMaxExtraDistance", 3.0);
     node->declare_parameter("gcopter.CrossHoleShapeTime", 0.5);
     node->declare_parameter("gcopter.CrossHoleRecoveryTime", 0.5);
     node->declare_parameter("gcopter.CrossHoleTimeMargin", 0.1);
@@ -133,6 +139,14 @@ struct Config
       node->get_parameter("gcopter.PlanningRetryIntervalMs").as_double();
     planning_retry_limit =
       static_cast<int>(node->get_parameter("gcopter.PlanningRetryLimit").as_int());
+    local_replan.minimum_lookahead_distance =
+      node->get_parameter("gcopter.LocalReplanMinLookaheadDistance").as_double();
+    local_replan.maximum_lookahead_distance =
+      node->get_parameter("gcopter.LocalReplanMaxLookaheadDistance").as_double();
+    local_replan.maximum_local_path_distance =
+      node->get_parameter("gcopter.LocalReplanMaxPathDistance").as_double();
+    local_replan.maximum_extra_distance =
+      node->get_parameter("gcopter.LocalReplanMaxExtraDistance").as_double();
     cross_hole_prepare_time = node->get_parameter("gcopter.CrossHoleShapeTime").as_double();
     cross_hole_recovery_time = node->get_parameter("gcopter.CrossHoleRecoveryTime").as_double();
     cross_hole_time_margin = node->get_parameter("gcopter.CrossHoleTimeMargin").as_double();
@@ -148,7 +162,15 @@ struct Config
       cross_hole_regions.size() % 4 == 0 && optimization.max_velocity > 0.0 &&
       optimization.max_acceleration > 0.0 && min_segment_duration > 0.0 &&
       std::isfinite(planning_retry_interval_ms) && planning_retry_interval_ms > 0.0 &&
-      planning_retry_limit >= 0;
+      planning_retry_limit >= 0 &&
+      std::isfinite(local_replan.minimum_lookahead_distance) &&
+      std::isfinite(local_replan.maximum_lookahead_distance) &&
+      std::isfinite(local_replan.maximum_local_path_distance) &&
+      std::isfinite(local_replan.maximum_extra_distance) &&
+      local_replan.minimum_lookahead_distance >= 0.0 &&
+      local_replan.maximum_lookahead_distance >= local_replan.minimum_lookahead_distance &&
+      local_replan.maximum_local_path_distance > 0.0 &&
+      local_replan.maximum_extra_distance >= 0.0;
   }
 };
 
@@ -173,7 +195,8 @@ public:
   bool FrontSearch(const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
     std::vector<Eigen::Vector2d> & route, std::string * failure_reason = nullptr);
   bool plan(const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
-    bool preserve_current_state = false);
+    bool preserve_current_state = false,
+    const std::vector<Eigen::Vector2d> * prescribed_route = nullptr);
   bool buildContinuousTrajectory(const MincoTrajectoryData & data,
     Trajectory<5, 2> & trajectory) const;
   bool hasTrajectoryCollision(const Trajectory<5, 2> & trajectory, double start_time,
@@ -209,6 +232,7 @@ private:
   MincoTrajectoryData initial_trajectory_data_;
   MincoTrajectoryData output_trajectory_data_;
   Trajectory<5, 2> continuous_trajectory_;
+  std::vector<Eigen::Vector2d> active_route_;
   std::vector<Eigen::Vector2d> startGoal_;
   nav_msgs::msg::Odometry odom_;
   plan_interfaces::msg::DynamicObstacleArray dynamic_obstacles_;

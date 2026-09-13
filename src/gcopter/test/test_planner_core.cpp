@@ -1,4 +1,5 @@
 #include "gcopter/corridor_generator.hpp"
+#include "gcopter/local_replan.hpp"
 #include "gcopter/path_search.hpp"
 #include "gcopter/trajectory_generation.hpp"
 
@@ -212,4 +213,55 @@ TEST(Trajectory, SafeInitialFallbackUsesTimeScalingWithoutMovingWaypoints)
   ASSERT_TRUE(PrepareSafeInitialTrajectory(map, initial, options, fallback, &reason)) << reason;
   EXPECT_TRUE(fallback.intermediate_positions.isApprox(initial.intermediate_positions));
   EXPECT_TRUE((fallback.segment_durations.array() >= initial.segment_durations.array()).all());
+}
+
+TEST(LocalReplan, RejoinsOriginalSuffixWithinAbsoluteDistanceLimits)
+{
+  GridMap2D map = makeMap(70, 30, 0.1);
+  const std::vector<Eigen::Vector2d> active_route{
+    {0.5, 1.0}, {1.0, 1.0}, {1.5, 1.0}, {2.0, 1.0}, {2.5, 1.0},
+    {3.0, 1.0}, {3.5, 1.0}, {4.0, 1.0}, {4.5, 1.0}};
+  const Eigen::Vector2i blocked = map.worldToGrid({1.5, 1.0});
+  map.raw_occupancy[static_cast<size_t>(map.index(blocked))] = 100U;
+  rebuild(map);
+
+  LocalReplanOptions options;
+  options.minimum_lookahead_distance = 1.0;
+  options.maximum_lookahead_distance = 3.0;
+  options.maximum_local_path_distance = 5.0;
+  options.maximum_extra_distance = 1.0;
+  std::vector<Eigen::Vector2d> output;
+  size_t rejoin_index = 0;
+  std::string reason;
+  ASSERT_TRUE(BuildLocalRejoinRoute(
+    map, active_route, active_route.front(), true, searchOptions(), options,
+    output, rejoin_index, reason)) << reason;
+  EXPECT_TRUE(output.front().isApprox(active_route.front()));
+  EXPECT_TRUE(output.back().isApprox(active_route.back()));
+  ASSERT_LT(rejoin_index + 1, active_route.size());
+  EXPECT_TRUE(std::find_if(output.begin(), output.end(), [&](const Eigen::Vector2d & point) {
+    return point.isApprox(active_route[rejoin_index + 1]);
+  }) != output.end());
+}
+
+TEST(LocalReplan, RejectsDetourBeyondAbsoluteExtraDistance)
+{
+  GridMap2D map = makeMap(70, 30, 0.1);
+  const std::vector<Eigen::Vector2d> active_route{
+    {0.5, 1.0}, {1.0, 1.0}, {1.5, 1.0}, {2.0, 1.0}, {2.5, 1.0}, {3.0, 1.0}};
+  const Eigen::Vector2i blocked = map.worldToGrid({1.5, 1.0});
+  map.raw_occupancy[static_cast<size_t>(map.index(blocked))] = 100U;
+  rebuild(map);
+  LocalReplanOptions options;
+  options.minimum_lookahead_distance = 1.0;
+  options.maximum_lookahead_distance = 2.5;
+  options.maximum_local_path_distance = 5.0;
+  options.maximum_extra_distance = 0.0;
+  std::vector<Eigen::Vector2d> output;
+  size_t rejoin_index = 0;
+  std::string reason;
+  EXPECT_FALSE(BuildLocalRejoinRoute(
+    map, active_route, active_route.front(), true, searchOptions(), options,
+    output, rejoin_index, reason));
+  EXPECT_EQ(reason, "no_rejoin_within_absolute_limits");
 }

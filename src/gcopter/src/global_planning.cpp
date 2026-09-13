@@ -328,7 +328,8 @@ bool GlobalPlanner::FrontSearch(
 
 bool GlobalPlanner::plan(
   const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
-  bool preserve_current_state)
+  bool preserve_current_state,
+  const std::vector<Eigen::Vector2d> * prescribed_route)
 {
   if (!config_valid_ || !mapInitialized_) {
     return false;
@@ -345,7 +346,18 @@ bool GlobalPlanner::plan(
   front_end_path_available_ = false;
 
   const auto search_begin = std::chrono::steady_clock::now();
-  if (!FrontSearch(start, goal, route_raw, &reason)) {
+  if (prescribed_route != nullptr) {
+    route_raw = *prescribed_route;
+    if (route_raw.size() < 2) {
+      reason = "invalid_prescribed_route";
+    } else {
+      route_raw.front() = start;
+      route_raw.back() = goal;
+    }
+  }
+  if ((prescribed_route != nullptr && route_raw.size() < 2) ||
+    (prescribed_route == nullptr && !FrontSearch(start, goal, route_raw, &reason)))
+  {
     publishPlanningPath({});
     const bool waiting_for_dynamic_clearance =
       !dynamic_obstacles_.obstacles.empty() &&
@@ -376,7 +388,12 @@ bool GlobalPlanner::plan(
   visualizer_.visualizeStartGoal(start, goal);
   visualizer_.visualizeRoute(route_raw);
   publishPlanningPath(route_raw);
-  publishPlanningStatus("FRONTEND_PATH_READY", false, "前端路径已发布，后端继续处理中");
+  publishPlanningStatus(
+    prescribed_route == nullptr ? "FRONTEND_PATH_READY" : "LOCAL_REJOIN_PATH_READY",
+    false,
+    prescribed_route == nullptr ?
+    "前端路径已发布，后端继续处理中" :
+    "局部接入路径与原路径后缀已拼接，正在重新生成整段 MINCO");
   if (!SamplePath(grid_map_, route_raw, route_sampled)) {
     route_sampled = route_raw;
     RCLCPP_WARN(node_->get_logger(), "路径稀疏化失败，保留完整前端 A* 路径继续处理");
@@ -392,7 +409,8 @@ bool GlobalPlanner::plan(
     publishPlanningPath(route_sampled);
     if (!GenerateCorridor(grid_map_, route_sampled, config_.corridor, corridors, reason)) {
       publishPlanningStatus(
-        "FRONTEND_PATH_ONLY", false, "corridor 生成失败：" + reason);
+        prescribed_route == nullptr ? "FRONTEND_PATH_ONLY" :
+        "LOCAL_REJOIN_PATH_ONLY", false, "corridor 生成失败：" + reason);
       RCLCPP_WARN(
         node_->get_logger(),
         "已降级为仅发布前端路径：corridor 生成失败：%s", reason.c_str());
@@ -422,7 +440,9 @@ bool GlobalPlanner::plan(
       config_.min_segment_duration, start_pva, initial_candidate))
   {
     publishPlanningStatus(
-      "CORRIDOR_PATH_ONLY", false, "初始 MINCO 数据生成失败，保留前端路径与 corridor");
+      prescribed_route == nullptr ? "CORRIDOR_PATH_ONLY" :
+      "LOCAL_REJOIN_CORRIDOR_PATH_ONLY", false,
+      "初始 MINCO 数据生成失败，保留前端路径与 corridor");
     RCLCPP_WARN(node_->get_logger(), "已降级为前端路径 + corridor：初始 MINCO 数据生成失败");
     if (!preserve_current_state) {
       have_plan_ = false;
@@ -451,8 +471,11 @@ bool GlobalPlanner::plan(
     grid_map_, initial_candidate, config_.optimization, output_candidate, &reason);
   const double minco_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - minco_begin).count();
-  std::string result_level = "OPTIMIZED_MINCO";
-  std::string result_detail = "优化后的 MINCO 轨迹已通过全部检查";
+  std::string result_level = prescribed_route == nullptr ?
+    "OPTIMIZED_MINCO" : "LOCAL_REJOIN_OPTIMIZED_MINCO";
+  std::string result_detail = prescribed_route == nullptr ?
+    "优化后的 MINCO 轨迹已通过全部检查" :
+    "局部 A* 接回原路径后缀，并已从当前 P/V/A 重新优化全部剩余 MINCO";
   bool optimized_usable = optimization_succeeded;
   if (optimized_usable && !ValidateTrajectoryData(output_candidate, reason)) {
     optimized_usable = false;
@@ -470,13 +493,16 @@ bool GlobalPlanner::plan(
   if (!optimized_usable && safe_initial_available) {
     output_candidate = safe_initial_candidate;
     trajectory_candidate = safe_initial_trajectory;
-    result_level = "SAFE_INITIAL_MINCO";
+    result_level = prescribed_route == nullptr ?
+      "SAFE_INITIAL_MINCO" : "LOCAL_REJOIN_SAFE_INITIAL_MINCO";
     result_detail = "优化阶段失败，已发布满足硬安全与运动包络的未优化 MINCO 轨迹：" + reason;
     RCLCPP_WARN(node_->get_logger(), "%s", result_detail.c_str());
   } else if (!optimized_usable) {
     const std::string detail = "MINCO 后端失败（" + reason +
       "），保底初始轨迹也不可用（" + initial_reason + "）";
-    publishPlanningStatus("CORRIDOR_PATH_ONLY", false, detail);
+    publishPlanningStatus(
+      prescribed_route == nullptr ? "CORRIDOR_PATH_ONLY" :
+      "LOCAL_REJOIN_CORRIDOR_PATH_ONLY", false, detail);
     RCLCPP_WARN(node_->get_logger(), "已降级为前端路径 + corridor：%s", detail.c_str());
     if (!preserve_current_state) {
       have_plan_ = false;
@@ -493,6 +519,7 @@ bool GlobalPlanner::plan(
   initial_trajectory_data_ = initial_candidate;
   output_trajectory_data_ = output_candidate;
   continuous_trajectory_ = trajectory_candidate;
+  active_route_ = route_raw;
   have_plan_ = true;
   trajStamp_ = node_->now().seconds();
   visualizer_.visualizeStartGoal(start, goal);
@@ -930,11 +957,14 @@ void GlobalPlanner::FSMCallBack_Timer()
 
   
   const bool goal_event = goal_changed_;
+  const bool trajectory_has_future = have_plan_ &&
+    current_sample_time + 0.05 < continuous_trajectory_.getTotalDuration();
   const bool pending_retry_due = !goal_event && pending_goal_retry_ && !have_plan_ &&
     map_changed_ && pending_goal_retry_count_ < config_.planning_retry_limit &&
     (now_seconds - last_plan_attempt_time_) * 1000.0 >= config_.planning_retry_interval_ms;
   bool map_requires_replan = false;
-  if (map_changed_ && have_plan_) {
+  bool dynamic_requires_replan = false;
+  if (map_changed_ && trajectory_has_future) {
     const bool cooldown_elapsed =
       (now_seconds - last_replan_time_) * 1000.0 >= config_.replan_cooldown_ms;
     map_requires_replan = cooldown_elapsed && hasTrajectoryCollision(
@@ -943,11 +973,12 @@ void GlobalPlanner::FSMCallBack_Timer()
   if (map_changed_) {
     map_changed_ = false;
   }
-  if (dynamic_obstacles_changed_ && have_plan_) {
+  if (dynamic_obstacles_changed_ && trajectory_has_future) {
     const bool cooldown_elapsed =
       (now_seconds - last_replan_time_) * 1000.0 >= config_.replan_cooldown_ms;
-    map_requires_replan = map_requires_replan || (cooldown_elapsed &&
-      hasDynamicObstacleConflict(continuous_trajectory_, current_sample_time, now_seconds));
+    dynamic_requires_replan = cooldown_elapsed &&
+      hasDynamicObstacleConflict(continuous_trajectory_, current_sample_time, now_seconds);
+    map_requires_replan = map_requires_replan || dynamic_requires_replan;
   }
   dynamic_obstacles_changed_ = false;
   if (!goal_event && !map_requires_replan && !pending_retry_due) {
@@ -967,7 +998,30 @@ void GlobalPlanner::FSMCallBack_Timer()
       node_->get_logger(), "动态净空自动重试 %d/%d",
       pending_goal_retry_count_ + 1, config_.planning_retry_limit);
   }
-  if (plan(planning_start, planning_goal, !goal_event && map_requires_replan)) {
+  std::vector<Eigen::Vector2d> local_rejoin_route;
+  const std::vector<Eigen::Vector2d> * prescribed_route = nullptr;
+  if (!goal_event && map_requires_replan && dynamic_requires_replan && !active_route_.empty()) {
+    size_t rejoin_index = 0;
+    std::string local_reason;
+    if (BuildLocalRejoinRoute(
+        grid_map_, active_route_, planning_start, config_.is_omni, config_.search,
+        config_.local_replan, local_rejoin_route, rejoin_index, local_reason))
+    {
+      prescribed_route = &local_rejoin_route;
+      RCLCPP_INFO(
+        node_->get_logger(),
+        "动态局部重规划接回原路径：rejoin_index=%zu local_points=%zu total_points=%zu",
+        rejoin_index, local_rejoin_route.size(), active_route_.size());
+    } else {
+      RCLCPP_WARN(
+        node_->get_logger(), "动态局部接入失败（%s），退回当前位置到原终点的全局 A*",
+        local_reason.c_str());
+    }
+  }
+  if (plan(
+      planning_start, planning_goal, !goal_event && map_requires_replan,
+      prescribed_route))
+  {
     last_replan_time_ = now_seconds;
     pending_goal_retry_ = false;
     pending_goal_retry_count_ = 0;

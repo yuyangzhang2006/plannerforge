@@ -43,12 +43,18 @@ corridor 是按路径顺序排列的有向凸矩形，以 `A*x <= b` 表示。�
 - `ReplanCooldownMs`：两次有效重规划之间的最短间隔。
 - `PlanningRetryIntervalMs`：起点或终点暂时被动态障碍物覆盖时，自动重试原任务的时间间隔。
 - `PlanningRetryLimit`：自动重试次数上限；达到上限后等待用户重新选择起终点。
+- `LocalReplanMinLookaheadDistance`：局部重规划接入点沿原路径向前的最小距离。
+- `LocalReplanMaxLookaheadDistance`：搜索原路径接入点的最远前视距离。
+- `LocalReplanMaxPathDistance`：当前位置到接入点的局部路径最大绝对长度。
+- `LocalReplanMaxExtraDistance`：局部路径相对当前位置到接入点直线距离允许增加的最大米数；不是百分比。
 
 每个动态障碍物观测包含位置、速度、矩形尺寸或圆形半径、时间戳、形状和有效时长。只有障碍物的预测运动与当前轨迹未来部分冲突时才触发重规划。重规划失败后，仅当旧轨迹仍安全时才保留旧轨迹；否则规划器会清除活动轨迹状态，并向控制器或上层监督节点报告错误。
 
 RViz 演示默认启用确定性的密集压力测试场景，共 12 个不同尺寸、速度和初始相位的动态矩形，运动模式包括横向往返、纵向往返、对角往返和椭圆运动。可用 `generate_dynamic_obstacles:=false` 启动参数关闭该场景。椭圆轨迹发布当前位置处的瞬时速度，规划器仍按 V1 的短时匀速模型进行保守预测。
 
 如果 A* 失败是因为起点、终点暂时被动态障碍物的硬膨胀区覆盖，规划器会发布 `WAITING_DYNAMIC_CLEARANCE`，保留用户选择的原始坐标，并在后续地图更新时按配置间隔自动重试。不会把起终点静默移动到别处。
+
+活动轨迹发生预测动态障碍物冲突时，规划器先在当前位置与原路径前方接入点之间执行局部 A*。接入点后保留原路径的空间拓扑，但不会直接拼接原来的多项式：系统使用当前实际 P/V/A 作为新起始边界，对“局部绕行 + 原路径后缀”重新生成全部剩余 corridor 与 MINCO 分段和时长。这样接入点不需要强行匹配旧轨迹的速度和加速度。局部接入无法满足绝对距离约束时，才回退为到原终点的全局 A*。
 
 ## 狗洞时间区间
 
@@ -65,9 +71,12 @@ RViz 演示默认启用确定性的密集压力测试场景，共 12 个不同�
 规划结果采用以下分级状态，并通过可靠、瞬态本地的 `/planner/status`（`std_msgs/msg/String`）发布。前端或稀疏后的标准路径通过 `/planner/path`（`nav_msgs/msg/Path`）发布：
 
 - `OPTIMIZED_MINCO`：完整优化轨迹，能够执行。
+- `LOCAL_REJOIN_OPTIMIZED_MINCO`：局部 A* 接回原路径后，对全部剩余路线重新优化得到的轨迹。
 - `SAFE_INITIAL_MINCO`：优化失败后使用的安全初始 MINCO，能够执行，但平滑性或时间代价不是最优。
+- `LOCAL_REJOIN_SAFE_INITIAL_MINCO`：局部接入后的优化失败，改用通过硬检查的安全初始 MINCO。
 - `CORRIDOR_PATH_ONLY`：前端路径和 corridor 成功，连续轨迹不可安全执行。
 - `FRONTEND_PATH_ONLY`：仅前端硬膨胀地图路径成功，不可直接作为 MINCO 控制轨迹执行。
+- `LOCAL_REJOIN_PATH_ONLY`、`LOCAL_REJOIN_CORRIDOR_PATH_ONLY`：局部接入路径已得到，但对应后端阶段未形成可执行连续轨迹。
 - `FAILED_NO_PATH`：前端也未找到可行路径。
 - `WAITING_DYNAMIC_CLEARANCE`：起终点或路线暂时被动态障碍物阻断，正在自动重试原任务。
 - `FAILED_NO_PATH_RETRY_EXHAUSTED`：自动重试达到配置上限，等待重新选择起终点。

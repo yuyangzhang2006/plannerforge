@@ -8,23 +8,23 @@
       is_plan_from_ego_pose: false
       PublishTrajectoryOdom: true
 
-      # Legacy alias retained for older launch files; NominalVel takes precedence.
+      # 为旧启动文件保留的兼容参数；NominalVel 优先。
       MaxVelMag: 0.5
       NominalVel: 0.5
 
-      # Calibrate these values for the actual robot.
+      # 以下尺寸需要根据实际机器人标定。
       RobotRadiusNormal: 0.30
       RobotRadiusCompact: 0.15
       StaticSafetyMargin: 0.05
 
-      # Initial scale ~= 1.1 * NominalVel^2 / MaxPlanAcc.
+      # 初始量级约为 1.1 * NominalVel^2 / MaxPlanAcc。
       TurnCostWeight: 0.18
       SafetyCostWeight: 0.0
       SafetyCostDistance: 0.50
       SpecialRegionCostWeight: 0.0
 
-      # Flat xmin,xmax,ymin,ymax tuples. Empty means no cross-hole semantics.
-      # Example: CrossHoleRegions: [-1.0, -0.5, 2.0, 2.4]
+      # 扁平的 xmin,xmax,ymin,ymax 数组；省略表示没有狗洞语义区域。
+      # 示例：CrossHoleRegions: [-1.0, -0.5, 2.0, 2.4]
 
       CorridorObstacleSearchRadius: 1.50
       CorridorFiriIterations: 4
@@ -47,6 +47,12 @@
       # 起终点暂时被动态障碍覆盖时，保留原点并等待障碍让开后自动重试。
       PlanningRetryIntervalMs: 1000.0
       PlanningRetryLimit: 20
+
+      # 动态冲突时局部接回原路径；限制均为绝对距离，不使用相对绕行比例。
+      LocalReplanMinLookaheadDistance: 1.5
+      LocalReplanMaxLookaheadDistance: 6.0
+      LocalReplanMaxPathDistance: 9.0
+      LocalReplanMaxExtraDistance: 3.0
 
       CrossHoleShapeTime: 0.5
       CrossHoleRecoveryTime: 0.5
