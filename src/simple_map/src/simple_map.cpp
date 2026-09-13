@@ -25,28 +25,53 @@ bool finiteVector(const std::vector<double> & values)
   });
 }
 
-enum class MotionAxis
+enum class MotionPattern
 {
-  X,
-  Y,
+  HORIZONTAL,
+  VERTICAL,
+  DIAGONAL,
+  ELLIPSE,
 };
 
-// 描述一个轴对齐矩形及其往返运动轨迹。
+// 描述一个轴对齐矩形及其确定性运动轨迹。比例值均相对于当前地图尺寸，
+// 因此同一测试场景可以适配不同分辨率的地图。
 struct MovingRectangle
 {
   double width_m;
   double height_m;
   double speed_mps;
-  double fixed_axis_ratio;
+  double center_x_ratio;
+  double center_y_ratio;
   double phase_ratio;
-  MotionAxis motion_axis;
+  double span_x_ratio;
+  double span_y_ratio;
+  MotionPattern motion_pattern;
 };
 
-constexpr std::array<MovingRectangle, 3> kMovingRectangles{{
-  {1.00, 0.85, 0.50, 0.30, 0.00, MotionAxis::X},
-  {0.90, 1.10, 0.40, 0.68, 0.35, MotionAxis::X},
-  {1.15, 0.90, 0.45, 0.55, 0.70, MotionAxis::Y},
+// 压力测试场景：横向、纵向、对角和椭圆运动混合，速度、尺寸和相位互不相同。
+// 数量保持为确定的 12 个，便于复现实验与比较规划耗时。
+constexpr std::array<MovingRectangle, 12> kMovingRectangles{{
+  {0.75, 0.55, 0.85, 0.50, 0.18, 0.00, 0.0, 0.0, MotionPattern::HORIZONTAL},
+  {0.55, 0.80, 0.62, 0.50, 0.38, 0.23, 0.0, 0.0, MotionPattern::HORIZONTAL},
+  {0.90, 0.60, 1.05, 0.50, 0.61, 0.49, 0.0, 0.0, MotionPattern::HORIZONTAL},
+  {0.65, 0.65, 0.74, 0.50, 0.82, 0.76, 0.0, 0.0, MotionPattern::HORIZONTAL},
+  {0.60, 0.90, 0.70, 0.17, 0.50, 0.12, 0.0, 0.0, MotionPattern::VERTICAL},
+  {0.80, 0.55, 0.92, 0.47, 0.50, 0.43, 0.0, 0.0, MotionPattern::VERTICAL},
+  {0.55, 0.75, 0.58, 0.79, 0.50, 0.71, 0.0, 0.0, MotionPattern::VERTICAL},
+  {0.55, 0.55, 0.82, 0.50, 0.50, 0.08, 0.0, 0.0, MotionPattern::DIAGONAL},
+  {0.70, 0.50, 0.66, 0.50, 0.50, 0.39, 0.0, 0.0, MotionPattern::DIAGONAL},
+  {0.50, 0.70, 0.97, 0.50, 0.50, 0.69, 0.0, 0.0, MotionPattern::DIAGONAL},
+  {0.65, 0.65, 0.78, 0.34, 0.48, 0.17, 0.15, 0.25, MotionPattern::ELLIPSE},
+  {0.85, 0.50, 0.60, 0.68, 0.54, 0.63, 0.13, 0.21, MotionPattern::ELLIPSE},
 }};
+
+struct MotionSample
+{
+  double x = 0.0;
+  double y = 0.0;
+  double velocity_x = 0.0;
+  double velocity_y = 0.0;
+};
 
 // 计算物体在给定区间内匀速往返运动的位置。
 double reflectedPosition(
@@ -78,6 +103,78 @@ double reflectedVelocity(
     std::max(0.0, traveled_distance) + std::clamp(phase_ratio, 0.0, 1.0) * cycle,
     cycle);
   return phase_distance <= travel ? speed : -speed;
+}
+
+MotionSample sampleMotion(
+  const MovingRectangle & rectangle,
+  double origin_x,
+  double origin_y,
+  double maximum_x,
+  double maximum_y,
+  double elapsed)
+{
+  MotionSample sample;
+  const double half_width = 0.5 * rectangle.width_m;
+  const double half_height = 0.5 * rectangle.height_m;
+  const double minimum_x = origin_x + half_width;
+  const double allowed_maximum_x = maximum_x - half_width;
+  const double minimum_y = origin_y + half_height;
+  const double allowed_maximum_y = maximum_y - half_height;
+  const double width = maximum_x - origin_x;
+  const double height = maximum_y - origin_y;
+
+  const auto fixed_x = [&]() {
+      return std::clamp(
+        origin_x + rectangle.center_x_ratio * width, minimum_x, allowed_maximum_x);
+    };
+  const auto fixed_y = [&]() {
+      return std::clamp(
+        origin_y + rectangle.center_y_ratio * height, minimum_y, allowed_maximum_y);
+    };
+
+  if (rectangle.motion_pattern == MotionPattern::HORIZONTAL) {
+    const double distance = rectangle.speed_mps * elapsed;
+    sample.x = reflectedPosition(
+      minimum_x, allowed_maximum_x, distance, rectangle.phase_ratio);
+    sample.y = fixed_y();
+    sample.velocity_x = reflectedVelocity(
+      minimum_x, allowed_maximum_x, distance, rectangle.phase_ratio, rectangle.speed_mps);
+  } else if (rectangle.motion_pattern == MotionPattern::VERTICAL) {
+    const double distance = rectangle.speed_mps * elapsed;
+    sample.x = fixed_x();
+    sample.y = reflectedPosition(
+      minimum_y, allowed_maximum_y, distance, rectangle.phase_ratio);
+    sample.velocity_y = reflectedVelocity(
+      minimum_y, allowed_maximum_y, distance, rectangle.phase_ratio, rectangle.speed_mps);
+  } else if (rectangle.motion_pattern == MotionPattern::DIAGONAL) {
+    const double x_distance = rectangle.speed_mps * elapsed;
+    const double y_speed = 0.67 * rectangle.speed_mps;
+    const double y_distance = y_speed * elapsed;
+    const double y_phase = std::fmod(rectangle.phase_ratio + 0.31, 1.0);
+    sample.x = reflectedPosition(
+      minimum_x, allowed_maximum_x, x_distance, rectangle.phase_ratio);
+    sample.y = reflectedPosition(minimum_y, allowed_maximum_y, y_distance, y_phase);
+    sample.velocity_x = reflectedVelocity(
+      minimum_x, allowed_maximum_x, x_distance, rectangle.phase_ratio, rectangle.speed_mps);
+    sample.velocity_y = reflectedVelocity(
+      minimum_y, allowed_maximum_y, y_distance, y_phase, y_speed);
+  } else {
+    const double center_x = fixed_x();
+    const double center_y = fixed_y();
+    const double radius_x = std::max(0.0, std::min({
+      rectangle.span_x_ratio * width, center_x - minimum_x, allowed_maximum_x - center_x}));
+    const double radius_y = std::max(0.0, std::min({
+      rectangle.span_y_ratio * height, center_y - minimum_y, allowed_maximum_y - center_y}));
+    const double reference_radius = std::max(0.1, std::max(radius_x, radius_y));
+    const double angular_speed = rectangle.speed_mps / reference_radius;
+    const double angle = 2.0 * std::acos(-1.0) * rectangle.phase_ratio +
+      angular_speed * elapsed;
+    sample.x = center_x + radius_x * std::cos(angle);
+    sample.y = center_y + radius_y * std::sin(angle);
+    sample.velocity_x = -radius_x * angular_speed * std::sin(angle);
+    sample.velocity_y = radius_y * angular_speed * std::cos(angle);
+  }
+  return sample;
 }
 
 // 将轴对齐矩形覆盖到 OccupancyGrid 中。
@@ -405,7 +502,7 @@ void SimpleMapNode::publishStaticMap()
 // ============================================================
 // Deterministic moving-obstacle source used by the demo and prediction tests.
 // 在这里接入或生成动态障碍，并写入传给规划器的地图数据。
-// 当前基线生成三个长宽约 1 m、沿 x 或 y 方向往返运动的矩形障碍。
+// 当前演示生成 12 个不同尺寸和速度的矩形，混合横向、纵向、对角与椭圆运动。
 // ============================================================
 
 
@@ -448,31 +545,13 @@ void SimpleMapNode::updateDynamicObstacles(
   const double elapsed = std::max(0.0, (now_time - dynamic_start_time_).seconds());
 
   for (const MovingRectangle & rectangle : kMovingRectangles) {
-    const double half_width = 0.5 * rectangle.width_m;
-    const double half_height = 0.5 * rectangle.height_m;
     if (map_width_m <= rectangle.width_m || map_height_m <= rectangle.height_m) {
       continue;
     }
-
-    double center_x = 0.0;
-    double center_y = 0.0;
-    if (rectangle.motion_axis == MotionAxis::X) {
-      center_x = reflectedPosition(
-        origin_x + half_width, map_max_x - half_width,
-        rectangle.speed_mps * elapsed, rectangle.phase_ratio);
-      center_y = std::clamp(
-        origin_y + rectangle.fixed_axis_ratio * map_height_m,
-        origin_y + half_height, map_max_y - half_height);
-    } else {
-      center_x = std::clamp(
-        origin_x + rectangle.fixed_axis_ratio * map_width_m,
-        origin_x + half_width, map_max_x - half_width);
-      center_y = reflectedPosition(
-        origin_y + half_height, map_max_y - half_height,
-        rectangle.speed_mps * elapsed, rectangle.phase_ratio);
-    }
+    const MotionSample motion = sampleMotion(
+      rectangle, origin_x, origin_y, map_max_x, map_max_y, elapsed);
     rasterizeRectangle(
-      center_x, center_y, rectangle.width_m, rectangle.height_m, map);
+      motion.x, motion.y, rectangle.width_m, rectangle.height_m, map);
   }
 }
 
@@ -507,29 +586,12 @@ void SimpleMapNode::timerCallback()
     obstacle.size.x = rectangle.width_m;
     obstacle.size.y = rectangle.height_m;
     obstacle.valid_for = 0.25;
-    const double half_width = 0.5 * rectangle.width_m;
-    const double half_height = 0.5 * rectangle.height_m;
-    if (rectangle.motion_axis == MotionAxis::X) {
-      obstacle.position.x = reflectedPosition(
-        origin_x + half_width, maximum_x - half_width,
-        rectangle.speed_mps * elapsed, rectangle.phase_ratio);
-      obstacle.position.y = std::clamp(
-        origin_y + rectangle.fixed_axis_ratio * (maximum_y - origin_y),
-        origin_y + half_height, maximum_y - half_height);
-      obstacle.velocity.x = reflectedVelocity(
-        origin_x + half_width, maximum_x - half_width,
-        rectangle.speed_mps * elapsed, rectangle.phase_ratio, rectangle.speed_mps);
-    } else {
-      obstacle.position.x = std::clamp(
-        origin_x + rectangle.fixed_axis_ratio * (maximum_x - origin_x),
-        origin_x + half_width, maximum_x - half_width);
-      obstacle.position.y = reflectedPosition(
-        origin_y + half_height, maximum_y - half_height,
-        rectangle.speed_mps * elapsed, rectangle.phase_ratio);
-      obstacle.velocity.y = reflectedVelocity(
-        origin_y + half_height, maximum_y - half_height,
-        rectangle.speed_mps * elapsed, rectangle.phase_ratio, rectangle.speed_mps);
-    }
+    const MotionSample motion = sampleMotion(
+      rectangle, origin_x, origin_y, maximum_x, maximum_y, elapsed);
+    obstacle.position.x = motion.x;
+    obstacle.position.y = motion.y;
+    obstacle.velocity.x = motion.velocity_x;
+    obstacle.velocity.y = motion.velocity_y;
     dynamic_message.obstacles.push_back(obstacle);
   }
   dynamic_pub_->publish(dynamic_message);

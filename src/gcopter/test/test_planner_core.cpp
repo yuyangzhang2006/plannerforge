@@ -60,6 +60,19 @@ TEST(PathSearch, DetoursAroundWall)
   }));
 }
 
+TEST(PathSearch, ReportsTemporarilyOccupiedEndpoint)
+{
+  GridMap2D map = makeMap();
+  const Eigen::Vector2d start = map.gridToWorld({2, 2});
+  map.raw_occupancy[static_cast<size_t>(map.index({2, 2}))] = 100U;
+  rebuild(map);
+  std::vector<Eigen::Vector2d> path;
+  std::string reason;
+  EXPECT_FALSE(PathSearch().search(
+    map, start, map.gridToWorld({15, 15}), true, searchOptions(), path, &reason));
+  EXPECT_EQ(reason, "start_occupied");
+}
+
 TEST(PathSearch, CrossHolePenaltySelectsNormalAlternative)
 {
   GridMap2D map = makeMap(20, 10, 0.1);

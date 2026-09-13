@@ -4,6 +4,7 @@
 
 #include <Eigen/Eigen>
 
+#include <string>
 #include <vector>
 
 // 前端路径搜索器，根据地图和起终点生成离散路径。
@@ -25,5 +26,6 @@ public:
     const Eigen::Vector2d & goal,
     bool is_omni,
     const Options & options,
-    std::vector<Eigen::Vector2d> & path);
+    std::vector<Eigen::Vector2d> & path,
+    std::string * failure_reason = nullptr);
 };

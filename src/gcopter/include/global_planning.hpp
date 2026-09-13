@@ -44,6 +44,8 @@ struct Config
   double dynamic_safety_margin = 0.15;
   double dynamic_obstacle_timeout = 0.5;
   double replan_cooldown_ms = 500.0;
+  double planning_retry_interval_ms = 1000.0;
+  int planning_retry_limit = 20;
   std::vector<double> cross_hole_regions;  // xmin, xmax, ymin, ymax tuples
   PathSearch::Options search;
   CorridorOptions corridor;
@@ -83,6 +85,8 @@ struct Config
     node->declare_parameter("gcopter.DynamicSafetyMargin", 0.15);
     node->declare_parameter("gcopter.DynamicObstacleTimeoutSec", 0.5);
     node->declare_parameter("gcopter.ReplanCooldownMs", 500.0);
+    node->declare_parameter("gcopter.PlanningRetryIntervalMs", 1000.0);
+    node->declare_parameter("gcopter.PlanningRetryLimit", 20);
     node->declare_parameter("gcopter.CrossHoleShapeTime", 0.5);
     node->declare_parameter("gcopter.CrossHoleRecoveryTime", 0.5);
     node->declare_parameter("gcopter.CrossHoleTimeMargin", 0.1);
@@ -125,6 +129,10 @@ struct Config
     dynamic_safety_margin = node->get_parameter("gcopter.DynamicSafetyMargin").as_double();
     dynamic_obstacle_timeout = node->get_parameter("gcopter.DynamicObstacleTimeoutSec").as_double();
     replan_cooldown_ms = node->get_parameter("gcopter.ReplanCooldownMs").as_double();
+    planning_retry_interval_ms =
+      node->get_parameter("gcopter.PlanningRetryIntervalMs").as_double();
+    planning_retry_limit =
+      static_cast<int>(node->get_parameter("gcopter.PlanningRetryLimit").as_int());
     cross_hole_prepare_time = node->get_parameter("gcopter.CrossHoleShapeTime").as_double();
     cross_hole_recovery_time = node->get_parameter("gcopter.CrossHoleRecoveryTime").as_double();
     cross_hole_time_margin = node->get_parameter("gcopter.CrossHoleTimeMargin").as_double();
@@ -138,7 +146,9 @@ struct Config
       std::isfinite(static_safety_margin) && robot_radius_normal >= robot_radius_compact &&
       robot_radius_compact >= 0.0 && static_safety_margin >= 0.0 &&
       cross_hole_regions.size() % 4 == 0 && optimization.max_velocity > 0.0 &&
-      optimization.max_acceleration > 0.0 && min_segment_duration > 0.0;
+      optimization.max_acceleration > 0.0 && min_segment_duration > 0.0 &&
+      std::isfinite(planning_retry_interval_ms) && planning_retry_interval_ms > 0.0 &&
+      planning_retry_limit >= 0;
   }
 };
 
@@ -161,7 +171,7 @@ public:
     const plan_interfaces::msg::DynamicObstacleArray::SharedPtr msg);
   void FSMCallBack_Timer();
   bool FrontSearch(const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
-    std::vector<Eigen::Vector2d> & route);
+    std::vector<Eigen::Vector2d> & route, std::string * failure_reason = nullptr);
   bool plan(const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
     bool preserve_current_state = false);
   bool buildContinuousTrajectory(const MincoTrajectoryData & data,
@@ -209,7 +219,11 @@ private:
   bool map_changed_ = false;
   bool dynamic_obstacles_changed_ = false;
   bool have_plan_ = false;
+  bool pending_goal_retry_ = false;
+  bool front_end_path_available_ = false;
+  int pending_goal_retry_count_ = 0;
   double trajStamp_ = 0.0;
   double trajectory_odom_yaw_ = 0.0;
   double last_replan_time_ = -std::numeric_limits<double>::infinity();
+  double last_plan_attempt_time_ = -std::numeric_limits<double>::infinity();
 };

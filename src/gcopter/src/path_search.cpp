@@ -13,9 +13,11 @@ bool PathSearch::search(
   const Eigen::Vector2d & goal,
   bool is_omni,
   const Options & options,
-  std::vector<Eigen::Vector2d> & path)
+  std::vector<Eigen::Vector2d> & path,
+  std::string * failure_reason)
 {
   path.clear();
+  if (failure_reason != nullptr) {failure_reason->clear();}
   if (!map.valid() || !start.allFinite() || !goal.allFinite() ||
     !std::isfinite(options.turn_cost_weight) || options.turn_cost_weight < 0.0 ||
     !std::isfinite(options.safety_cost_weight) || options.safety_cost_weight < 0.0 ||
@@ -23,18 +25,33 @@ bool PathSearch::search(
     !std::isfinite(options.special_region_cost_weight) ||
     options.special_region_cost_weight < 0.0)
   {
+    if (failure_reason != nullptr) {*failure_reason = "invalid_input";}
     return false;
   }
 
   const Eigen::Vector2i start_grid = map.worldToGrid(start);
   const Eigen::Vector2i goal_grid = map.worldToGrid(goal);
-  if (!map.isInside(start_grid) || !map.isInside(goal_grid) ||
-    map.isOccupied(start_grid) || map.isOccupied(goal_grid))
-  {
+  if (!map.isInside(start_grid)) {
+    if (failure_reason != nullptr) {*failure_reason = "start_outside_map";}
+    return false;
+  }
+  if (!map.isInside(goal_grid)) {
+    if (failure_reason != nullptr) {*failure_reason = "goal_outside_map";}
+    return false;
+  }
+  if (map.isOccupied(start_grid)) {
+    if (failure_reason != nullptr) {*failure_reason = "start_occupied";}
+    return false;
+  }
+  if (map.isOccupied(goal_grid)) {
+    if (failure_reason != nullptr) {*failure_reason = "goal_occupied";}
     return false;
   }
   if (start_grid == goal_grid) {
-    if ((start - goal).norm() <= 1.0e-9) {return false;}
+    if ((start - goal).norm() <= 1.0e-9) {
+      if (failure_reason != nullptr) {*failure_reason = "identical_start_goal";}
+      return false;
+    }
     path = {start, goal};
     return true;
   }
@@ -134,15 +151,24 @@ bool PathSearch::search(
       }
     }
   }
-  if (goal_state < 0) {return false;}
+  if (goal_state < 0) {
+    if (failure_reason != nullptr) {*failure_reason = "search_exhausted";}
+    return false;
+  }
 
   std::vector<int> reverse_cells;
   for (int state = goal_state; state >= 0; state = parent[static_cast<size_t>(state)]) {
     reverse_cells.push_back(state / kDirectionStates);
     if (state == start_state) {break;}
-    if (reverse_cells.size() > state_count) {return false;}
+    if (reverse_cells.size() > state_count) {
+      if (failure_reason != nullptr) {*failure_reason = "parent_cycle";}
+      return false;
+    }
   }
-  if (reverse_cells.empty() || reverse_cells.back() != map.index(start_grid)) {return false;}
+  if (reverse_cells.empty() || reverse_cells.back() != map.index(start_grid)) {
+    if (failure_reason != nullptr) {*failure_reason = "reconstruction_failed";}
+    return false;
+  }
   std::reverse(reverse_cells.begin(), reverse_cells.end());
   path.reserve(reverse_cells.size());
   for (const int cell : reverse_cells) {

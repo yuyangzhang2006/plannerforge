@@ -45,10 +45,12 @@ ros2 launch gcopter planner_forge.launch.py
 
 规划采用分级保底发布：前端 A* 成功后会立即发布黄色离散路径；后端优化失败时优先发布经过硬安全校验的未优化 MINCO 轨迹；若无法生成可安全执行的连续轨迹，则仍保留黄色路径，并在 `/planner/status` 中标明当前完成层级和不可直接执行的原因。标准离散路径同时发布在 `/planner/path`。
 
-启用示例动态障碍：
+密集动态障碍物暂时压住起点或终点时，状态会显示 `WAITING_DYNAMIC_CLEARANCE`。规划器会保留你点选的原坐标并自动重试，无需重复选择两次。
+
+演示默认启用 12 个密集动态障碍物，包含横向、纵向、对角和椭圆运动。临时关闭动态障碍物：
 
 ```bash
-ros2 launch gcopter planner_forge.launch.py generate_dynamic_obstacles:=true
+ros2 launch gcopter planner_forge.launch.py generate_dynamic_obstacles:=false
 ```
 
 关闭 RViz：

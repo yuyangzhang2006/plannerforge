@@ -84,8 +84,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "generate_dynamic_obstacles",
-                default_value="false",
-                description="Overlay the deterministic moving rectangle examples",
+                default_value="true",
+                description="是否启用确定性的密集动态障碍物压力测试",
             ),
             DeclareLaunchArgument(
                 "rviz",

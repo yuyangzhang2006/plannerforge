@@ -44,6 +44,9 @@
       DynamicSafetyMargin: 0.15
       DynamicObstacleTimeoutSec: 0.5
       ReplanCooldownMs: 500.0
+      # 起终点暂时被动态障碍覆盖时，保留原点并等待障碍让开后自动重试。
+      PlanningRetryIntervalMs: 1000.0
+      PlanningRetryLimit: 20
 
       CrossHoleShapeTime: 0.5
       CrossHoleRecoveryTime: 0.5

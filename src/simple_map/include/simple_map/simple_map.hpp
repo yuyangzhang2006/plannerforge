@@ -41,7 +41,7 @@ public:
   // 返回节点是否完成地图初始化。
   bool initialized() const {return initialized_;}
 
-  // 在静态地图副本上写入当前时刻的多个移动矩形障碍。
+  // 在静态地图副本上写入当前时刻的多模式移动矩形障碍。
   void updateDynamicObstacles(
     const rclcpp::Time & now,
     nav_msgs::msg::OccupancyGrid & map) const;

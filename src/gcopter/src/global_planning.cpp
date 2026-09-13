@@ -273,6 +273,8 @@ void GlobalPlanner::targetCallBack(const geometry_msgs::msg::PoseStamped::Shared
     startGoal_.emplace_back(odom_.pose.pose.position.x, odom_.pose.pose.position.y);
     startGoal_.push_back(received);
     goal_changed_ = true;
+    pending_goal_retry_ = true;
+    pending_goal_retry_count_ = 0;
     visualizer_.visualizeStartGoal(startGoal_[0], startGoal_[1]);
     return;
   }
@@ -283,6 +285,8 @@ void GlobalPlanner::targetCallBack(const geometry_msgs::msg::PoseStamped::Shared
   startGoal_.push_back(received);
   if (startGoal_.size() == 2) {
     goal_changed_ = true;
+    pending_goal_retry_ = true;
+    pending_goal_retry_count_ = 0;
     visualizer_.visualizeStartGoal(startGoal_[0], startGoal_[1]);
   } else {
     RCLCPP_INFO(
@@ -315,9 +319,11 @@ void GlobalPlanner::dynamicObstacleCallBack(
 bool GlobalPlanner::FrontSearch(
   const Eigen::Vector2d & start,
   const Eigen::Vector2d & goal,
-  std::vector<Eigen::Vector2d> & route)
+  std::vector<Eigen::Vector2d> & route,
+  std::string * failure_reason)
 {
-  return path_search_.search(grid_map_, start, goal, config_.is_omni, config_.search, route);
+  return path_search_.search(
+    grid_map_, start, goal, config_.is_omni, config_.search, route, failure_reason);
 }
 
 bool GlobalPlanner::plan(
@@ -336,12 +342,25 @@ bool GlobalPlanner::plan(
   std::string reason;
   std::vector<ConvexCorridor2D> corridors;
   const auto total_begin = std::chrono::steady_clock::now();
+  front_end_path_available_ = false;
 
   const auto search_begin = std::chrono::steady_clock::now();
-  if (!FrontSearch(start, goal, route_raw)) {
+  if (!FrontSearch(start, goal, route_raw, &reason)) {
     publishPlanningPath({});
-    publishPlanningStatus("FAILED_NO_PATH", false, "前端 A* 未找到可行路径");
-    RCLCPP_WARN(node_->get_logger(), "规划失败：前端 A* 未找到可行路径");
+    const bool waiting_for_dynamic_clearance =
+      !dynamic_obstacles_.obstacles.empty() &&
+      (reason == "start_occupied" || reason == "goal_occupied" ||
+      reason == "search_exhausted");
+    if (waiting_for_dynamic_clearance) {
+      publishPlanningStatus(
+        "WAITING_DYNAMIC_CLEARANCE", false,
+        "前端暂不可达（" + reason + "），保留原起终点并等待动态障碍物让开后自动重试");
+      RCLCPP_WARN(
+        node_->get_logger(), "前端暂不可达：%s；将自动重试原起终点", reason.c_str());
+    } else {
+      publishPlanningStatus("FAILED_NO_PATH", false, "前端 A* 失败：" + reason);
+      RCLCPP_WARN(node_->get_logger(), "规划失败：前端 A*：%s", reason.c_str());
+    }
     if (!preserve_current_state) {
       have_plan_ = false;
       continuous_trajectory_.clear();
@@ -349,6 +368,7 @@ bool GlobalPlanner::plan(
     }
     return false;
   }
+  front_end_path_available_ = true;
   const double search_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - search_begin).count();
   // 前端一成功就立即发布。后端即使耗时或失败，用户和上层仍能取得一条
@@ -910,6 +930,9 @@ void GlobalPlanner::FSMCallBack_Timer()
 
   
   const bool goal_event = goal_changed_;
+  const bool pending_retry_due = !goal_event && pending_goal_retry_ && !have_plan_ &&
+    map_changed_ && pending_goal_retry_count_ < config_.planning_retry_limit &&
+    (now_seconds - last_plan_attempt_time_) * 1000.0 >= config_.planning_retry_interval_ms;
   bool map_requires_replan = false;
   if (map_changed_ && have_plan_) {
     const bool cooldown_elapsed =
@@ -927,7 +950,7 @@ void GlobalPlanner::FSMCallBack_Timer()
       hasDynamicObstacleConflict(continuous_trajectory_, current_sample_time, now_seconds));
   }
   dynamic_obstacles_changed_ = false;
-  if (!goal_event && !map_requires_replan) {
+  if (!goal_event && !map_requires_replan && !pending_retry_due) {
     return;
   }
 
@@ -938,8 +961,30 @@ void GlobalPlanner::FSMCallBack_Timer()
   }
   const Eigen::Vector2d planning_goal = startGoal_[1];
   goal_changed_ = false;
+  last_plan_attempt_time_ = now_seconds;
+  if (pending_retry_due) {
+    RCLCPP_INFO(
+      node_->get_logger(), "动态净空自动重试 %d/%d",
+      pending_goal_retry_count_ + 1, config_.planning_retry_limit);
+  }
   if (plan(planning_start, planning_goal, !goal_event && map_requires_replan)) {
     last_replan_time_ = now_seconds;
+    pending_goal_retry_ = false;
+    pending_goal_retry_count_ = 0;
+  } else if ((goal_event || pending_retry_due) && !front_end_path_available_) {
+    ++pending_goal_retry_count_;
+    if (pending_goal_retry_count_ >= config_.planning_retry_limit) {
+      pending_goal_retry_ = false;
+      publishPlanningStatus(
+        "FAILED_NO_PATH_RETRY_EXHAUSTED", false,
+        "动态净空自动重试次数已用完，请重新选择起终点");
+      RCLCPP_WARN(
+        node_->get_logger(), "动态净空自动重试已达到上限 %d", config_.planning_retry_limit);
+    }
+  } else if (goal_event || pending_retry_due) {
+    // 已经发布了前端保底路径，不再因后端降级反复执行整条规划流水线。
+    pending_goal_retry_ = false;
+    pending_goal_retry_count_ = 0;
   } else if (map_requires_replan &&
     (hasTrajectoryCollision(continuous_trajectory_, current_sample_time, config_.prediction_horizon) ||
     hasDynamicObstacleConflict(continuous_trajectory_, current_sample_time, now_seconds)))
