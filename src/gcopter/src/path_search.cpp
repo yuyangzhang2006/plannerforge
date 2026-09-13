@@ -3,49 +3,26 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <functional>
 #include <limits>
 #include <queue>
-#include <utility>
 #include <vector>
-
-
-
-
-
-
-
-
-
-
-// ============================================================
-// TODO(阶段② 前端搜索)
-// 在这里实现并改进路径搜索算法、代价函数和邻接扩展方式。
-// 当前基线使用 Dijkstra，is_omni 控制四邻接或八邻接。
-// ============================================================
-
-
-
-
-
-
-
-
-
 
 bool PathSearch::search(
   const GridMap2D & map,
   const Eigen::Vector2d & start,
   const Eigen::Vector2d & goal,
   bool is_omni,
+  const Options & options,
   std::vector<Eigen::Vector2d> & path)
 {
   path.clear();
-
-  if (!map.valid() || !start.allFinite() || !goal.allFinite()) {
-    return false;
-  }
-  if ((start - goal).squaredNorm() <= 0.0) {
+  if (!map.valid() || !start.allFinite() || !goal.allFinite() ||
+    !std::isfinite(options.turn_cost_weight) || options.turn_cost_weight < 0.0 ||
+    !std::isfinite(options.safety_cost_weight) || options.safety_cost_weight < 0.0 ||
+    !std::isfinite(options.safety_cost_distance) || options.safety_cost_distance < 0.0 ||
+    !std::isfinite(options.special_region_cost_weight) ||
+    options.special_region_cost_weight < 0.0)
+  {
     return false;
   }
 
@@ -57,132 +34,121 @@ bool PathSearch::search(
     return false;
   }
   if (start_grid == goal_grid) {
+    if ((start - goal).norm() <= 1.0e-9) {return false;}
     path = {start, goal};
     return true;
   }
 
-  struct QueueNode
-  {
-    double cost;
-    int index;
-  };
+  const std::array<Eigen::Vector2i, 8> directions = {
+    Eigen::Vector2i(1, 0), Eigen::Vector2i(1, 1), Eigen::Vector2i(0, 1),
+    Eigen::Vector2i(-1, 1), Eigen::Vector2i(-1, 0), Eigen::Vector2i(-1, -1),
+    Eigen::Vector2i(0, -1), Eigen::Vector2i(1, -1)};
+  const int direction_count = is_omni ? 8 : 4;
+  // Four-connected mode uses the cardinal entries from the same angular ordering.
+  const std::array<int, 8> active_direction = is_omni ?
+    std::array<int, 8>{0, 1, 2, 3, 4, 5, 6, 7} :
+    std::array<int, 8>{0, 2, 4, 6, 0, 0, 0, 0};
 
-  // 优先队列按累计路径代价从小到大取出节点。
-  const auto queue_compare = [](const QueueNode & lhs, const QueueNode & rhs) {
-      if (lhs.cost != rhs.cost) {
-        return lhs.cost > rhs.cost;
-      }
-      return lhs.index > rhs.index;
+  constexpr int kStartDirection = 8;
+  constexpr int kDirectionStates = 9;
+  const auto stateIndex = [](int cell, int direction) {
+      return cell * kDirectionStates + direction;
+    };
+  const auto octile = [&](const Eigen::Vector2i & cell) {
+      const int dx = std::abs(cell.x() - goal_grid.x());
+      const int dy = std::abs(cell.y() - goal_grid.y());
+      return map.resolution *
+             (static_cast<double>(std::max(dx, dy)) +
+             (std::sqrt(2.0) - 1.0) * static_cast<double>(std::min(dx, dy)));
     };
 
-  const size_t cell_count =
-    static_cast<size_t>(map.width) * static_cast<size_t>(map.height);
-  std::vector<double> distance(cell_count, std::numeric_limits<double>::infinity());
-  std::vector<int> parent(cell_count, -1);
-  std::vector<bool> closed(cell_count, false);
-  std::priority_queue<QueueNode, std::vector<QueueNode>, decltype(queue_compare)> open(
-    queue_compare);
+  struct QueueNode {double f; double g; int state;};
+  const auto compare = [](const QueueNode & lhs, const QueueNode & rhs) {
+      if (lhs.f != rhs.f) {return lhs.f > rhs.f;}
+      if (lhs.g != rhs.g) {return lhs.g > rhs.g;}
+      return lhs.state > rhs.state;
+    };
+  const size_t state_count = map.cellCount() * kDirectionStates;
+  std::vector<double> best(state_count, std::numeric_limits<double>::infinity());
+  std::vector<int> parent(state_count, -1);
+  std::vector<uint8_t> closed(state_count, 0U);
+  std::priority_queue<QueueNode, std::vector<QueueNode>, decltype(compare)> open(compare);
 
-  const int start_index = map.index(start_grid);
-  const int goal_index = map.index(goal_grid);
-  distance[static_cast<size_t>(start_index)] = 0.0;
-  open.push({0.0, start_index});
+  const int start_state = stateIndex(map.index(start_grid), kStartDirection);
+  best[static_cast<size_t>(start_state)] = 0.0;
+  open.push({octile(start_grid), 0.0, start_state});
+  int goal_state = -1;
 
-  const std::array<Eigen::Vector2i, 8> directions = {
-    Eigen::Vector2i(1, 0), Eigen::Vector2i(-1, 0),
-    Eigen::Vector2i(0, 1), Eigen::Vector2i(0, -1),
-    Eigen::Vector2i(1, 1), Eigen::Vector2i(1, -1),
-    Eigen::Vector2i(-1, 1), Eigen::Vector2i(-1, -1)};
-  const int direction_count = is_omni ? 8 : 4;
-
-  size_t closed_count = 0;
-  while (!open.empty() && closed_count < cell_count) {
+  while (!open.empty()) {
     const QueueNode current = open.top();
     open.pop();
-    const size_t current_index = static_cast<size_t>(current.index);
-    if (closed[current_index] || current.cost > distance[current_index]) {
+    if (closed[static_cast<size_t>(current.state)] != 0U ||
+      current.g > best[static_cast<size_t>(current.state)] + 1.0e-12)
+    {
       continue;
     }
-
-    closed[current_index] = true;
-    ++closed_count;
-    if (current.index == goal_index) {
+    closed[static_cast<size_t>(current.state)] = 1U;
+    const int current_cell = current.state / kDirectionStates;
+    const int incoming = current.state % kDirectionStates;
+    if (current_cell == map.index(goal_grid)) {
+      goal_state = current.state;
       break;
     }
-
-    const Eigen::Vector2i current_grid(
-      current.index % map.width, current.index / map.width);
-    for (int direction_index = 0; direction_index < direction_count; ++direction_index) {
-      const Eigen::Vector2i step = directions[static_cast<size_t>(direction_index)];
+    const Eigen::Vector2i current_grid(current_cell % map.width, current_cell / map.width);
+    for (int active = 0; active < direction_count; ++active) {
+      const int direction = active_direction[static_cast<size_t>(active)];
+      const Eigen::Vector2i step = directions[static_cast<size_t>(direction)];
       const Eigen::Vector2i next_grid = current_grid + step;
-      if (!map.isInside(next_grid) || map.isOccupied(next_grid)) {
+      if (map.isOccupied(next_grid)) {continue;}
+      const bool diagonal = step.x() != 0 && step.y() != 0;
+      if (diagonal && (map.isOccupied({current_grid.x() + step.x(), current_grid.y()}) ||
+        map.isOccupied({current_grid.x(), current_grid.y() + step.y()})))
+      {
         continue;
       }
 
-      const bool diagonal = step.x() != 0 && step.y() != 0;
-      if (diagonal) {
-        // 对角移动需要同时满足两个相邻正交栅格可通行。
-        const Eigen::Vector2i horizontal(current_grid.x() + step.x(), current_grid.y());
-        const Eigen::Vector2i vertical(current_grid.x(), current_grid.y() + step.y());
-        if (map.isOccupied(horizontal) || map.isOccupied(vertical)) {
-          continue;
+      const double length = map.resolution * (diagonal ? std::sqrt(2.0) : 1.0);
+      double turn = 0.0;
+      if (incoming != kStartDirection) {
+        int delta = std::abs(direction - incoming);
+        delta = std::min(delta, 8 - delta);
+        turn = options.turn_cost_weight * static_cast<double>(delta) *
+          (std::acos(-1.0) / 4.0);
+      }
+      double safety = 0.0;
+      if (options.safety_cost_weight > 0.0 && options.safety_cost_distance > 0.0) {
+        const double clearance = map.clearanceAt(next_grid);
+        if (clearance < options.safety_cost_distance) {
+          const double ratio = 1.0 - clearance / options.safety_cost_distance;
+          safety = options.safety_cost_weight * length * ratio * ratio;
         }
       }
-
-      const int next_index = map.index(next_grid);
-      if (closed[static_cast<size_t>(next_index)]) {
-        continue;
-      }
-      const double step_cost = diagonal ?
-        std::sqrt(2.0) * map.resolution : map.resolution;
-      const double new_cost = current.cost + step_cost;
-      if (new_cost < distance[static_cast<size_t>(next_index)]) {
-        distance[static_cast<size_t>(next_index)] = new_cost;
-        parent[static_cast<size_t>(next_index)] = current.index;
-        open.push({new_cost, next_index});
+      const double semantic = map.semanticAt(next_grid) == MapSemantic::CROSS_HOLE ?
+        options.special_region_cost_weight * length : 0.0;
+      const double next_g = current.g + length + turn + safety + semantic;
+      const int next_state = stateIndex(map.index(next_grid), direction);
+      if (next_g + 1.0e-12 < best[static_cast<size_t>(next_state)]) {
+        best[static_cast<size_t>(next_state)] = next_g;
+        parent[static_cast<size_t>(next_state)] = current.state;
+        open.push({next_g + octile(next_grid), next_g, next_state});
       }
     }
   }
+  if (goal_state < 0) {return false;}
 
-  if (!closed[static_cast<size_t>(goal_index)]) {
-    return false;
+  std::vector<int> reverse_cells;
+  for (int state = goal_state; state >= 0; state = parent[static_cast<size_t>(state)]) {
+    reverse_cells.push_back(state / kDirectionStates);
+    if (state == start_state) {break;}
+    if (reverse_cells.size() > state_count) {return false;}
   }
-
-  // parent 记录搜索树，回溯后得到从起点到终点的栅格序列。
-  std::vector<int> reverse_indices;
-  reverse_indices.reserve(cell_count);
-  int current_index = goal_index;
-  while (current_index != start_index && reverse_indices.size() < cell_count) {
-    reverse_indices.push_back(current_index);
-    current_index = parent[static_cast<size_t>(current_index)];
-    if (current_index < 0) {
-      path.clear();
-      return false;
-    }
-  }
-  if (current_index != start_index) {
-    return false;
-  }
-  reverse_indices.push_back(start_index);
-  std::reverse(reverse_indices.begin(), reverse_indices.end());
-
-  path.reserve(reverse_indices.size());
-  for (const int index : reverse_indices) {
-    const Eigen::Vector2i grid(index % map.width, index / map.width);
-    path.push_back(map.gridToWorld(grid));
-  }
-  if (path.size() < 2) {
-    path.clear();
-    return false;
+  if (reverse_cells.empty() || reverse_cells.back() != map.index(start_grid)) {return false;}
+  std::reverse(reverse_cells.begin(), reverse_cells.end());
+  path.reserve(reverse_cells.size());
+  for (const int cell : reverse_cells) {
+    path.push_back(map.gridToWorld({cell % map.width, cell / map.width}));
   }
   path.front() = start;
   path.back() = goal;
-  if (!std::all_of(path.begin(), path.end(), [](const Eigen::Vector2d & point) {
-      return point.allFinite();
-    }))
-  {
-    path.clear();
-    return false;
-  }
-  return true;
+  return path.size() >= 2;
 }

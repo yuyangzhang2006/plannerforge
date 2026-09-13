@@ -13,6 +13,7 @@ find_package(rclcpp REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(plan_interfaces REQUIRED)
 
 # 地图处理库和 ROS 节点。
 add_library(simple_map_lib
@@ -24,6 +25,7 @@ target_include_directories(simple_map_lib PUBLIC
 ament_target_dependencies(simple_map_lib
   rclcpp
   nav_msgs
+  plan_interfaces
   cv_bridge)
 target_link_libraries(simple_map_lib ${OpenCV_LIBS})
 

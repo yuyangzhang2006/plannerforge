@@ -67,6 +67,19 @@ double reflectedPosition(
     minimum + phase_distance : maximum - (phase_distance - travel);
 }
 
+double reflectedVelocity(
+  double minimum, double maximum, double traveled_distance, double phase_ratio,
+  double speed)
+{
+  const double travel = maximum - minimum;
+  if (!std::isfinite(travel) || travel <= 0.0) {return 0.0;}
+  const double cycle = 2.0 * travel;
+  const double phase_distance = std::fmod(
+    std::max(0.0, traveled_distance) + std::clamp(phase_ratio, 0.0, 1.0) * cycle,
+    cycle);
+  return phase_distance <= travel ? speed : -speed;
+}
+
 // 将轴对齐矩形覆盖到 OccupancyGrid 中。
 void rasterizeRectangle(
   double center_x,
@@ -119,7 +132,8 @@ void rasterizeRectangle(
 
 
 // ============================================================
-// TODO(阶段① 地图处理)
+// Convert the source image into the raw occupancy map. Footprint inflation and
+// distance fields are derived by the planner so dynamic updates use the same policy.
 // 在这里加入机器人半径、安全余量、障碍膨胀、距离场或安全走廊等处理。
 // 当前基线只做灰度阈值转换，输出中 0 表示可通行，100 表示障碍。
 // ============================================================
@@ -281,6 +295,8 @@ SimpleMapNode::SimpleMapNode(const rclcpp::NodeOptions & options)
   map_qos.reliable();
   map_qos.transient_local();
   map_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("/grid_map", map_qos);
+  dynamic_pub_ = create_publisher<plan_interfaces::msg::DynamicObstacleArray>(
+    "/dynamic_obstacles", map_qos);
 
   initialized_ = true;
   RCLCPP_INFO(
@@ -365,6 +381,9 @@ void SimpleMapNode::publishStaticMap()
   combined_map_.header.stamp = now();
   combined_map_.info.map_load_time = combined_map_.header.stamp;
   map_pub_->publish(combined_map_);
+  plan_interfaces::msg::DynamicObstacleArray dynamic_message;
+  dynamic_message.header = combined_map_.header;
+  dynamic_pub_->publish(dynamic_message);
 }
 
 
@@ -384,7 +403,7 @@ void SimpleMapNode::publishStaticMap()
 
 
 // ============================================================
-// TODO(阶段④ 动态障碍地图)
+// Deterministic moving-obstacle source used by the demo and prediction tests.
 // 在这里接入或生成动态障碍，并写入传给规划器的地图数据。
 // 当前基线生成三个长宽约 1 m、沿 x 或 y 方向往返运动的矩形障碍。
 // ============================================================
@@ -469,6 +488,51 @@ void SimpleMapNode::timerCallback()
   combined_map_.header.stamp = stamp;
   combined_map_.info.map_load_time = stamp;
   map_pub_->publish(combined_map_);
+
+  plan_interfaces::msg::DynamicObstacleArray dynamic_message;
+  dynamic_message.header = combined_map_.header;
+  const double resolution = combined_map_.info.resolution;
+  const double origin_x = combined_map_.info.origin.position.x;
+  const double origin_y = combined_map_.info.origin.position.y;
+  const double maximum_x = origin_x + combined_map_.info.width * resolution;
+  const double maximum_y = origin_y + combined_map_.info.height * resolution;
+  const double elapsed = std::max(0.0, (stamp - dynamic_start_time_).seconds());
+  for (const MovingRectangle & rectangle : kMovingRectangles) {
+    if (maximum_x - origin_x <= rectangle.width_m ||
+      maximum_y - origin_y <= rectangle.height_m)
+    {continue;}
+    plan_interfaces::msg::DynamicObstacle obstacle;
+    obstacle.header = dynamic_message.header;
+    obstacle.shape = plan_interfaces::msg::DynamicObstacle::SHAPE_BOX;
+    obstacle.size.x = rectangle.width_m;
+    obstacle.size.y = rectangle.height_m;
+    obstacle.valid_for = 0.25;
+    const double half_width = 0.5 * rectangle.width_m;
+    const double half_height = 0.5 * rectangle.height_m;
+    if (rectangle.motion_axis == MotionAxis::X) {
+      obstacle.position.x = reflectedPosition(
+        origin_x + half_width, maximum_x - half_width,
+        rectangle.speed_mps * elapsed, rectangle.phase_ratio);
+      obstacle.position.y = std::clamp(
+        origin_y + rectangle.fixed_axis_ratio * (maximum_y - origin_y),
+        origin_y + half_height, maximum_y - half_height);
+      obstacle.velocity.x = reflectedVelocity(
+        origin_x + half_width, maximum_x - half_width,
+        rectangle.speed_mps * elapsed, rectangle.phase_ratio, rectangle.speed_mps);
+    } else {
+      obstacle.position.x = std::clamp(
+        origin_x + rectangle.fixed_axis_ratio * (maximum_x - origin_x),
+        origin_x + half_width, maximum_x - half_width);
+      obstacle.position.y = reflectedPosition(
+        origin_y + half_height, maximum_y - half_height,
+        rectangle.speed_mps * elapsed, rectangle.phase_ratio);
+      obstacle.velocity.y = reflectedVelocity(
+        origin_y + half_height, maximum_y - half_height,
+        rectangle.speed_mps * elapsed, rectangle.phase_ratio, rectangle.speed_mps);
+    }
+    dynamic_message.obstacles.push_back(obstacle);
+  }
+  dynamic_pub_->publish(dynamic_message);
 }
 
 }  // namespace simple_map

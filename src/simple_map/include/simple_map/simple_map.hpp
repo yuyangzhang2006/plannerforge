@@ -3,6 +3,7 @@
 #include <opencv2/core.hpp>
 
 #include <nav_msgs/msg/occupancy_grid.hpp>
+#include <plan_interfaces/msg/dynamic_obstacle_array.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include <string>
@@ -62,6 +63,7 @@ private:
 
   // ROS 对象和动态障碍运动的时间基准。
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr map_pub_;
+  rclcpp::Publisher<plan_interfaces::msg::DynamicObstacleArray>::SharedPtr dynamic_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Time dynamic_start_time_;
   bool initialized_ = false;

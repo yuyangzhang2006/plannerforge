@@ -1,0 +1,9 @@
+std_msgs/Header header
+geometry_msgs/Point position
+geometry_msgs/Vector3 velocity
+geometry_msgs/Vector3 size
+uint8 SHAPE_CIRCLE=0
+uint8 SHAPE_BOX=1
+uint8 shape
+float64 radius
+float64 valid_for

@@ -1,35 +1,52 @@
 #pragma once
 
+#include "gcopter/corridor_generator.hpp"
 #include "gcopter/grid_map_2d.hpp"
 #include "gcopter/path_search.hpp"
 #include "gcopter/traj_representation.hpp"
 #include "gcopter/trajectory.hpp"
+#include "gcopter/trajectory_generation.hpp"
 #include "gcopter/visualizer.hpp"
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <plan_interfaces/msg/minco_trajectory.hpp>
+#include <plan_interfaces/msg/dynamic_obstacle_array.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
-// global_planning 节点使用的 topic、规划模式和标称速度参数。
 struct Config
 {
-  std::string mapTopic;                  // OccupancyGrid 输入
-  std::string targetTopic;               // PoseStamped 起终点输入
-  std::string odomTopic;                 // map 坐标 odom 输入或离线输出
-  bool is_omni = true;                   // true 八邻接，false 四邻接
-  bool is_plan_from_ego_pose = false;     // 起点是否取实时 odom
-  bool publish_trajectory_odom = true;    // false 模式是否发布演示 odom
-  double maxVelMag = 0.5;                // 基线时间分配使用的标称速度，单位 m/s
+  std::string mapTopic;
+  std::string targetTopic;
+  std::string odomTopic;
+  bool is_omni = true;
+  bool is_plan_from_ego_pose = false;
+  bool publish_trajectory_odom = true;
+  double nominal_velocity = 0.5;
+  double robot_radius_normal = 0.30;
+  double robot_radius_compact = 0.15;
+  double static_safety_margin = 0.05;
+  double min_segment_duration = 0.15;
+  double cross_hole_prepare_time = 0.5;
+  double cross_hole_recovery_time = 0.5;
+  double cross_hole_time_margin = 0.1;
+  double prediction_horizon = 2.0;
+  double dynamic_safety_margin = 0.15;
+  double dynamic_obstacle_timeout = 0.5;
+  double replan_cooldown_ms = 500.0;
+  std::vector<double> cross_hole_regions;  // xmin, xmax, ymin, ymax tuples
+  PathSearch::Options search;
+  CorridorOptions corridor;
+  OptimizationOptions optimization;
 
-  // 从 ROS 参数服务器读取配置。
   explicit Config(const rclcpp::Node::SharedPtr & node)
   {
     node->declare_parameter("gcopter.MapTopic", std::string("/grid_map"));
@@ -39,6 +56,34 @@ struct Config
     node->declare_parameter("gcopter.is_plan_from_ego_pose", false);
     node->declare_parameter("gcopter.PublishTrajectoryOdom", true);
     node->declare_parameter("gcopter.MaxVelMag", 0.5);
+    node->declare_parameter("gcopter.NominalVel", 0.5);
+    node->declare_parameter("gcopter.RobotRadiusNormal", 0.30);
+    node->declare_parameter("gcopter.RobotRadiusCompact", 0.15);
+    node->declare_parameter("gcopter.StaticSafetyMargin", 0.05);
+    node->declare_parameter("gcopter.TurnCostWeight", 0.0);
+    node->declare_parameter("gcopter.SafetyCostWeight", 0.0);
+    node->declare_parameter("gcopter.SafetyCostDistance", 0.5);
+    node->declare_parameter("gcopter.SpecialRegionCostWeight", 0.0);
+    node->declare_parameter("gcopter.CrossHoleRegions", std::vector<double>{});
+    node->declare_parameter("gcopter.CorridorObstacleSearchRadius", 1.5);
+    node->declare_parameter("gcopter.CorridorFiriIterations", 4);
+    node->declare_parameter("gcopter.CorridorMinOverlap", 0.08);
+    node->declare_parameter("gcopter.CorridorMergeTolerance", 1.0e-4);
+    node->declare_parameter("gcopter.MaxPlanVel", 1.0);
+    node->declare_parameter("gcopter.MaxPlanAcc", 1.5);
+    node->declare_parameter("gcopter.MinSegmentDuration", 0.15);
+    node->declare_parameter("gcopter.WeightTime", 1.0);
+    node->declare_parameter("gcopter.WeightVelPenalty", 10.0);
+    node->declare_parameter("gcopter.WeightAccPenalty", 10.0);
+    node->declare_parameter("gcopter.OptimizationMaxIterations", 30);
+    node->declare_parameter("gcopter.OptimizationTimeBudgetMs", 30.0);
+    node->declare_parameter("gcopter.PredictionHorizonSec", 2.0);
+    node->declare_parameter("gcopter.DynamicSafetyMargin", 0.15);
+    node->declare_parameter("gcopter.DynamicObstacleTimeoutSec", 0.5);
+    node->declare_parameter("gcopter.ReplanCooldownMs", 500.0);
+    node->declare_parameter("gcopter.CrossHoleShapeTime", 0.5);
+    node->declare_parameter("gcopter.CrossHoleRecoveryTime", 0.5);
+    node->declare_parameter("gcopter.CrossHoleTimeMargin", 0.1);
 
     mapTopic = node->get_parameter("gcopter.MapTopic").as_string();
     targetTopic = node->get_parameter("gcopter.TargetTopic").as_string();
@@ -46,95 +91,102 @@ struct Config
     is_omni = node->get_parameter("gcopter.is_omni").as_bool();
     is_plan_from_ego_pose = node->get_parameter("gcopter.is_plan_from_ego_pose").as_bool();
     publish_trajectory_odom = node->get_parameter("gcopter.PublishTrajectoryOdom").as_bool();
-    maxVelMag = node->get_parameter("gcopter.MaxVelMag").as_double();
+    nominal_velocity = node->get_parameter("gcopter.NominalVel").as_double();
+    const double legacy_velocity = node->get_parameter("gcopter.MaxVelMag").as_double();
+    if (nominal_velocity == 0.5 && legacy_velocity != 0.5) {nominal_velocity = legacy_velocity;}
+    robot_radius_normal = node->get_parameter("gcopter.RobotRadiusNormal").as_double();
+    robot_radius_compact = node->get_parameter("gcopter.RobotRadiusCompact").as_double();
+    static_safety_margin = node->get_parameter("gcopter.StaticSafetyMargin").as_double();
+    search.turn_cost_weight = node->get_parameter("gcopter.TurnCostWeight").as_double();
+    search.safety_cost_weight = node->get_parameter("gcopter.SafetyCostWeight").as_double();
+    search.safety_cost_distance = node->get_parameter("gcopter.SafetyCostDistance").as_double();
+    search.special_region_cost_weight =
+      node->get_parameter("gcopter.SpecialRegionCostWeight").as_double();
+    cross_hole_regions = node->get_parameter("gcopter.CrossHoleRegions").as_double_array();
+    corridor.obstacle_search_radius =
+      node->get_parameter("gcopter.CorridorObstacleSearchRadius").as_double();
+    corridor.firi_iterations =
+      static_cast<int>(node->get_parameter("gcopter.CorridorFiriIterations").as_int());
+    corridor.minimum_overlap = node->get_parameter("gcopter.CorridorMinOverlap").as_double();
+    corridor.merge_tolerance = node->get_parameter("gcopter.CorridorMergeTolerance").as_double();
+    optimization.max_velocity = node->get_parameter("gcopter.MaxPlanVel").as_double();
+    optimization.max_acceleration = node->get_parameter("gcopter.MaxPlanAcc").as_double();
+    min_segment_duration = node->get_parameter("gcopter.MinSegmentDuration").as_double();
+    optimization.minimum_segment_duration = min_segment_duration;
+    optimization.weight_time = node->get_parameter("gcopter.WeightTime").as_double();
+    optimization.weight_velocity = node->get_parameter("gcopter.WeightVelPenalty").as_double();
+    optimization.weight_acceleration = node->get_parameter("gcopter.WeightAccPenalty").as_double();
+    optimization.maximum_iterations =
+      static_cast<int>(node->get_parameter("gcopter.OptimizationMaxIterations").as_int());
+    optimization.time_budget_ms = node->get_parameter("gcopter.OptimizationTimeBudgetMs").as_double();
+    prediction_horizon = node->get_parameter("gcopter.PredictionHorizonSec").as_double();
+    dynamic_safety_margin = node->get_parameter("gcopter.DynamicSafetyMargin").as_double();
+    dynamic_obstacle_timeout = node->get_parameter("gcopter.DynamicObstacleTimeoutSec").as_double();
+    replan_cooldown_ms = node->get_parameter("gcopter.ReplanCooldownMs").as_double();
+    cross_hole_prepare_time = node->get_parameter("gcopter.CrossHoleShapeTime").as_double();
+    cross_hole_recovery_time = node->get_parameter("gcopter.CrossHoleRecoveryTime").as_double();
+    cross_hole_time_margin = node->get_parameter("gcopter.CrossHoleTimeMargin").as_double();
   }
 
-  // 检查 topic 名称和标称速度。
   bool valid() const
   {
     return !mapTopic.empty() && !targetTopic.empty() && !odomTopic.empty() &&
-      std::isfinite(maxVelMag) && maxVelMag > 0.0;
+      std::isfinite(nominal_velocity) && nominal_velocity > 0.0 &&
+      std::isfinite(robot_radius_normal) && std::isfinite(robot_radius_compact) &&
+      std::isfinite(static_safety_margin) && robot_radius_normal >= robot_radius_compact &&
+      robot_radius_compact >= 0.0 && static_safety_margin >= 0.0 &&
+      cross_hole_regions.size() % 4 == 0 && optimization.max_velocity > 0.0 &&
+      optimization.max_acceleration > 0.0 && min_segment_duration > 0.0;
   }
 };
 
-// 计算当前轨迹采样时刻，并限制在轨迹有效时间范围内。
-inline double clampTrajectorySampleTime(double now, double trajectory_stamp, double total_duration)
+inline double clampTrajectorySampleTime(double now, double stamp, double duration)
 {
-  if (!std::isfinite(now) || !std::isfinite(trajectory_stamp) ||
-    !std::isfinite(total_duration) || total_duration <= 0.0)
-  {
+  if (!std::isfinite(now) || !std::isfinite(stamp) || !std::isfinite(duration) || duration <= 0.0) {
     return 0.0;
   }
-  return std::clamp(now - trajectory_stamp, 0.0, total_duration);
+  return std::clamp(now - stamp, 0.0, duration);
 }
 
-// 组织地图、目标、odom、路径搜索、轨迹生成和轨迹发布。
 class GlobalPlanner
 {
 public:
   GlobalPlanner(const Config & config, const rclcpp::Node::SharedPtr & node);
-
-  // 接收 map 坐标系下的里程计。
   void odomCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
-
-  // 接收 OccupancyGrid 并转换为规划器内部地图。
   void mapCallBack(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
-
-  // 接收起终点或 ego 模式下的目标点。
   void targetCallBack(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
-
-  // 推进轨迹时间，并处理规划与重规划触发。
+  void dynamicObstacleCallBack(
+    const plan_interfaces::msg::DynamicObstacleArray::SharedPtr msg);
   void FSMCallBack_Timer();
-
-  // 调用 PathSearch 生成离散路径。
-  bool FrontSearch(
-    const Eigen::Vector2d & start,
-    const Eigen::Vector2d & goal,
+  bool FrontSearch(const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
     std::vector<Eigen::Vector2d> & route);
-
-  // 执行一次完整规划并发布成功结果。
-  bool plan(const Eigen::Vector2d & start, const Eigen::Vector2d & goal);
-
-  // 根据后端数据生成可按时间查询的连续轨迹。
-  bool buildContinuousTrajectory(
-    const MincoTrajectoryData & trajectory_data,
+  bool plan(const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
+    bool preserve_current_state = false);
+  bool buildContinuousTrajectory(const MincoTrajectoryData & data,
     Trajectory<5, 2> & trajectory) const;
-
-  // 检查轨迹指定时刻之后的采样点是否落入障碍。
-  bool hasTrajectoryCollision(
-    const Trajectory<5, 2> & trajectory,
-    double start_time) const;
-
-  // 填写连接点空间标志和过洞相关占位信息。
-  void updateWaypointSpaciousFlags(MincoTrajectoryData & trajectory_data) const;
-
-  // 将内部轨迹数据转换并发布为 MincoTrajectory 消息。
-  void publishMincoTrajectory(const MincoTrajectoryData & trajectory_data);
-
-  // 在连续轨迹上采样并生成 odom 消息。
-  bool fillTrajectoryOdom(
-    const Trajectory<5, 2> & source_trajectory,
-    double elapsed_time,
+  bool hasTrajectoryCollision(const Trajectory<5, 2> & trajectory, double start_time,
+    double horizon = std::numeric_limits<double>::infinity()) const;
+  bool hasDynamicObstacleConflict(
+    const Trajectory<5, 2> & trajectory, double start_time, double now_seconds) const;
+  void updateWaypointSpaciousFlags(MincoTrajectoryData & data) const;
+  void extractCrossHoleIntervals(const Trajectory<5, 2> & trajectory,
+    MincoTrajectoryData & data) const;
+  void publishMincoTrajectory(const MincoTrajectoryData & data);
+  bool fillTrajectoryOdom(const Trajectory<5, 2> & trajectory, double elapsed_time,
     nav_msgs::msg::Odometry & odom_message);
-
-  // 发布 false 模式使用的轨迹 odom。
   void publishTrajectoryOdom(double elapsed_time);
 
 private:
-  // 节点配置和 ROS 辅助对象。
   Config config_;
   rclcpp::Node::SharedPtr node_;
   Visualizer visualizer_;
-
-  // ROS 输入、输出和定时器。
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr mapSub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr targetSub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odomSub_;
+  rclcpp::Subscription<plan_interfaces::msg::DynamicObstacleArray>::SharedPtr dynamicSub_;
   rclcpp::Publisher<plan_interfaces::msg::MincoTrajectory>::SharedPtr traj_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr trajectory_odom_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
-
-  // 地图、规划结果和当前位置。
   GridMap2D grid_map_;
   PathSearch path_search_;
   MincoTrajectoryData initial_trajectory_data_;
@@ -142,14 +194,15 @@ private:
   Trajectory<5, 2> continuous_trajectory_;
   std::vector<Eigen::Vector2d> startGoal_;
   nav_msgs::msg::Odometry odom_;
-
-  // 节点状态。
-  bool config_valid_ = false;             // 参数已经通过检查
-  bool mapInitialized_ = false;           // 已收到合法地图
-  bool odomInitialized_ = false;          // 已收到或生成合法 odom
-  bool goal_changed_ = false;             // 已形成一组新的起终点
-  bool map_changed_ = false;               // 已收到新地图，等待检查剩余轨迹
-  bool have_plan_ = false;                 // 当前持有一条成功发布的轨迹
-  double trajStamp_ = 0.0;                 // 当前轨迹起始 ROS 时间，单位 s
-  double trajectory_odom_yaw_ = 0.0;       // 低速时保持的上一帧车体 yaw
+  plan_interfaces::msg::DynamicObstacleArray dynamic_obstacles_;
+  bool config_valid_ = false;
+  bool mapInitialized_ = false;
+  bool odomInitialized_ = false;
+  bool goal_changed_ = false;
+  bool map_changed_ = false;
+  bool dynamic_obstacles_changed_ = false;
+  bool have_plan_ = false;
+  double trajStamp_ = 0.0;
+  double trajectory_odom_yaw_ = 0.0;
+  double last_replan_time_ = -std::numeric_limits<double>::infinity();
 };

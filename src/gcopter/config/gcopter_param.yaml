@@ -4,16 +4,46 @@
       MapTopic: "/grid_map"
       TargetTopic: "/goal_pose"
       OdomTopic: "/Odometry_to_base_link"
-
-      # true 使用八邻接搜索，false 使用四邻接搜索。
       is_omni: true
-
-      # false 时，前两条 /goal_pose 依次作为起点和终点，之后按轨迹时间推进内部位置。
-      # true 时，每条 /goal_pose 都是终点，规划起点取最近一帧 map 坐标 odom。
       is_plan_from_ego_pose: false
-
-      # false 模式离线运行时发布轨迹 odom；接入真实 odom 时设置为 false。
       PublishTrajectoryOdom: true
 
-      # 基线时间分配使用的标称速度，单位 m/s。连续轨迹速度约束由后端实现。
+      # Legacy alias retained for older launch files; NominalVel takes precedence.
       MaxVelMag: 0.5
+      NominalVel: 0.5
+
+      # Calibrate these values for the actual robot.
+      RobotRadiusNormal: 0.30
+      RobotRadiusCompact: 0.15
+      StaticSafetyMargin: 0.05
+
+      TurnCostWeight: 0.0
+      SafetyCostWeight: 0.0
+      SafetyCostDistance: 0.50
+      SpecialRegionCostWeight: 0.0
+
+      # Flat xmin,xmax,ymin,ymax tuples. Empty means no cross-hole semantics.
+      # Example: CrossHoleRegions: [-1.0, -0.5, 2.0, 2.4]
+
+      CorridorObstacleSearchRadius: 1.50
+      CorridorFiriIterations: 4
+      CorridorMinOverlap: 0.08
+      CorridorMergeTolerance: 0.0001
+
+      MaxPlanVel: 1.0
+      MaxPlanAcc: 1.5
+      MinSegmentDuration: 0.15
+      WeightTime: 1.0
+      WeightVelPenalty: 10.0
+      WeightAccPenalty: 10.0
+      OptimizationMaxIterations: 30
+      OptimizationTimeBudgetMs: 30.0
+
+      PredictionHorizonSec: 2.0
+      DynamicSafetyMargin: 0.15
+      DynamicObstacleTimeoutSec: 0.5
+      ReplanCooldownMs: 500.0
+
+      CrossHoleShapeTime: 0.5
+      CrossHoleRecoveryTime: 0.5
+      CrossHoleTimeMargin: 0.1

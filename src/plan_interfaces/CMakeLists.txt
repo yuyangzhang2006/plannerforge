@@ -8,6 +8,8 @@ find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CmdVelOri.msg"
+  "msg/DynamicObstacle.msg"
+  "msg/DynamicObstacleArray.msg"
   "msg/MincoTrajectory.msg"
   DEPENDENCIES geometry_msgs std_msgs)
 

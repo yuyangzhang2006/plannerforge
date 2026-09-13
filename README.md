@@ -1,5 +1,8 @@
 # PlannerForge
 
+Planner parameters, runtime behavior, and current implementation limits are
+documented in [docs/planner_parameters.md](docs/planner_parameters.md).
+
 PlannerForge 是一个二维导航规划框架。当前版本包含地图读取、栅格搜索、轨迹生成、MINCO 解算和 RViz 显示，可以单独构建运行。
 
 ## 目录

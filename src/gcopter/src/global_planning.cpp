@@ -79,6 +79,10 @@ GlobalPlanner::GlobalPlanner(const Config & config, const rclcpp::Node::SharedPt
     config_.mapTopic, map_qos,
     std::bind(&GlobalPlanner::mapCallBack, this, std::placeholders::_1));
 
+  dynamicSub_ = node_->create_subscription<plan_interfaces::msg::DynamicObstacleArray>(
+    "/dynamic_obstacles", rclcpp::SensorDataQoS(),
+    std::bind(&GlobalPlanner::dynamicObstacleCallBack, this, std::placeholders::_1));
+
   rclcpp::QoS trajectory_qos(rclcpp::KeepLast(20));
   trajectory_qos.reliable();
   trajectory_qos.durability_volatile();
@@ -103,7 +107,7 @@ GlobalPlanner::GlobalPlanner(const Config & config, const rclcpp::Node::SharedPt
     "PlannerForge ready: map=%s target=%s odom=%s is_omni=%s ego_start=%s speed=%.3f m/s",
     config_.mapTopic.c_str(), config_.targetTopic.c_str(), config_.odomTopic.c_str(),
     config_.is_omni ? "true" : "false",
-    config_.is_plan_from_ego_pose ? "true" : "false", config_.maxVelMag);
+    config_.is_plan_from_ego_pose ? "true" : "false", config_.nominal_velocity);
 }
 
 void GlobalPlanner::odomCallBack(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -171,7 +175,7 @@ void GlobalPlanner::mapCallBack(const nav_msgs::msg::OccupancyGrid::SharedPtr ms
 
 
   // ============================================================
-  // TODO(阶段① 地图信息传输)
+  // Derive hard footprint layers, clearance, and configured semantic regions.
   // 在这里接入膨胀地图、代价地图、SDF 或自定义地图消息的转换结果。
   // 当前基线将 OccupancyGrid 中所有非零值转换为占据栅格。
   // ============================================================
@@ -192,10 +196,33 @@ void GlobalPlanner::mapCallBack(const nav_msgs::msg::OccupancyGrid::SharedPtr ms
     msg->info.origin.position.x, msg->info.origin.position.y);
   candidate.width = static_cast<int>(msg->info.width);
   candidate.height = static_cast<int>(msg->info.height);
-  candidate.data.resize(expected_size);
-  std::transform(msg->data.begin(), msg->data.end(), candidate.data.begin(), [](int8_t value) {
+  candidate.raw_occupancy.resize(expected_size);
+  std::transform(msg->data.begin(), msg->data.end(), candidate.raw_occupancy.begin(), [](int8_t value) {
     return static_cast<uint8_t>(value == 0 ? 0 : 100);
   });
+  candidate.semantic.assign(expected_size, static_cast<uint8_t>(MapSemantic::NORMAL));
+  for (size_t region = 0; region + 3 < config_.cross_hole_regions.size(); region += 4) {
+    const double min_x = std::min(config_.cross_hole_regions[region], config_.cross_hole_regions[region + 1]);
+    const double max_x = std::max(config_.cross_hole_regions[region], config_.cross_hole_regions[region + 1]);
+    const double min_y = std::min(config_.cross_hole_regions[region + 2], config_.cross_hole_regions[region + 3]);
+    const double max_y = std::max(config_.cross_hole_regions[region + 2], config_.cross_hole_regions[region + 3]);
+    for (int y = 0; y < candidate.height; ++y) {
+      for (int x = 0; x < candidate.width; ++x) {
+        const Eigen::Vector2d point = candidate.gridToWorld({x, y});
+        if (point.x() >= min_x && point.x() <= max_x && point.y() >= min_y && point.y() <= max_y) {
+          candidate.semantic[static_cast<size_t>(candidate.index({x, y}))] =
+            static_cast<uint8_t>(MapSemantic::CROSS_HOLE);
+        }
+      }
+    }
+  }
+  if (!candidate.buildDerivedLayers(
+      config_.robot_radius_normal + config_.static_safety_margin,
+      config_.robot_radius_compact + config_.static_safety_margin))
+  {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to derive inflated map layers");
+    return;
+  }
   if (!candidate.valid()) {
     RCLCPP_ERROR(node_->get_logger(), "Rejected grid map after internal validation");
     return;
@@ -256,15 +283,37 @@ void GlobalPlanner::targetCallBack(const geometry_msgs::msg::PoseStamped::Shared
   }
 }
 
+void GlobalPlanner::dynamicObstacleCallBack(
+  const plan_interfaces::msg::DynamicObstacleArray::SharedPtr msg)
+{
+  if (!msg || (!msg->header.frame_id.empty() && msg->header.frame_id != "map")) {return;}
+  for (const auto & obstacle : msg->obstacles) {
+    if (!std::isfinite(obstacle.position.x) || !std::isfinite(obstacle.position.y) ||
+      !std::isfinite(obstacle.velocity.x) || !std::isfinite(obstacle.velocity.y) ||
+      !std::isfinite(obstacle.size.x) || !std::isfinite(obstacle.size.y) ||
+      !std::isfinite(obstacle.radius) || !std::isfinite(obstacle.valid_for) ||
+      obstacle.size.x < 0.0 || obstacle.size.y < 0.0 || obstacle.radius < 0.0 ||
+      obstacle.valid_for < 0.0)
+    {
+      RCLCPP_WARN(node_->get_logger(), "Rejected invalid dynamic obstacle array");
+      return;
+    }
+  }
+  dynamic_obstacles_ = *msg;
+  dynamic_obstacles_changed_ = true;
+}
+
 bool GlobalPlanner::FrontSearch(
   const Eigen::Vector2d & start,
   const Eigen::Vector2d & goal,
   std::vector<Eigen::Vector2d> & route)
 {
-  return path_search_.search(grid_map_, start, goal, config_.is_omni, route);
+  return path_search_.search(grid_map_, start, goal, config_.is_omni, config_.search, route);
 }
 
-bool GlobalPlanner::plan(const Eigen::Vector2d & start, const Eigen::Vector2d & goal)
+bool GlobalPlanner::plan(
+  const Eigen::Vector2d & start, const Eigen::Vector2d & goal,
+  bool preserve_current_state)
 {
   if (!config_valid_ || !mapInitialized_) {
     return false;
@@ -276,24 +325,56 @@ bool GlobalPlanner::plan(const Eigen::Vector2d & start, const Eigen::Vector2d & 
   MincoTrajectoryData output_candidate;
   Trajectory<5, 2> trajectory_candidate;
   std::string reason;
+  std::vector<ConvexCorridor2D> corridors;
+  const auto total_begin = std::chrono::steady_clock::now();
 
+  const auto search_begin = std::chrono::steady_clock::now();
   if (!FrontSearch(start, goal, route_raw)) {
     RCLCPP_WARN(node_->get_logger(), "Planning failed at FrontSearch");
     return false;
   }
+  const double search_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - search_begin).count();
   if (!SamplePath(grid_map_, route_raw, route_sampled)) {
     RCLCPP_WARN(node_->get_logger(), "Planning failed at SamplePath");
     return false;
   }
-  if (!GenerateTrajectory(route_sampled, config_.maxVelMag, initial_candidate)) {
+  const auto corridor_begin = std::chrono::steady_clock::now();
+  if (!GenerateCorridor(grid_map_, route_sampled, config_.corridor, corridors, reason)) {
+    // Conservative recovery: restore the front-end grid points and retry without
+    // changing the selected topological route or rerunning A*.
+    route_sampled = route_raw;
+    if (!GenerateCorridor(grid_map_, route_sampled, config_.corridor, corridors, reason)) {
+      RCLCPP_WARN(node_->get_logger(), "Planning failed at GenerateCorridor: %s", reason.c_str());
+      return false;
+    }
+  }
+  const double corridor_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - corridor_begin).count();
+
+  Eigen::Matrix<double, 2, 3> start_pva = Eigen::Matrix<double, 2, 3>::Zero();
+  if (preserve_current_state && have_plan_) {
+    const double sample_time = clampTrajectorySampleTime(
+      node_->now().seconds(), trajStamp_, continuous_trajectory_.getTotalDuration());
+    start_pva.col(0) = continuous_trajectory_.getPos(sample_time).head<2>();
+    start_pva.col(1) = continuous_trajectory_.getVel(sample_time).head<2>();
+    start_pva.col(2) = continuous_trajectory_.getAcc(sample_time).head<2>();
+  }
+  start_pva.col(0) = start;
+  if (!GenerateTrajectory(route_sampled, corridors, config_.nominal_velocity,
+      config_.min_segment_duration, start_pva, initial_candidate))
+  {
     RCLCPP_WARN(node_->get_logger(), "Planning failed at GenerateTrajectory");
     return false;
   }
   updateWaypointSpaciousFlags(initial_candidate);
-  if (!OptimizeTrajectory(grid_map_, initial_candidate, output_candidate)) {
+  const auto minco_begin = std::chrono::steady_clock::now();
+  if (!OptimizeTrajectory(grid_map_, initial_candidate, config_.optimization, output_candidate)) {
     RCLCPP_WARN(node_->get_logger(), "Planning failed at OptimizeTrajectory");
     return false;
   }
+  const double minco_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - minco_begin).count();
   if (!ValidateTrajectoryData(output_candidate, reason)) {
     RCLCPP_WARN(
       node_->get_logger(), "Planning rejected backend output: %s", reason.c_str());
@@ -308,6 +389,9 @@ bool GlobalPlanner::plan(const Eigen::Vector2d & start, const Eigen::Vector2d & 
     return false;
   }
 
+  extractCrossHoleIntervals(trajectory_candidate, output_candidate);
+  updateWaypointSpaciousFlags(output_candidate);
+
   publishMincoTrajectory(output_candidate);
   initial_trajectory_data_ = initial_candidate;
   output_trajectory_data_ = output_candidate;
@@ -317,10 +401,29 @@ bool GlobalPlanner::plan(const Eigen::Vector2d & start, const Eigen::Vector2d & 
   visualizer_.visualizeStartGoal(start, goal);
   visualizer_.visualizeRoute(route_sampled);
   visualizer_.visualizeTrajectory(continuous_trajectory_);
+  double path_length = 0.0;
+  for (size_t i = 1; i < route_raw.size(); ++i) {path_length += (route_raw[i] - route_raw[i - 1]).norm();}
+  double max_velocity = 0.0;
+  double max_acceleration = 0.0;
+  double minimum_clearance = std::numeric_limits<double>::infinity();
+  const double duration = continuous_trajectory_.getTotalDuration();
+  for (double time = 0.0; time <= duration; time += 0.02) {
+    const Eigen::Vector2d position = continuous_trajectory_.getPos(std::min(time, duration)).head<2>();
+    max_velocity = std::max(max_velocity, continuous_trajectory_.getVel(std::min(time, duration)).norm());
+    max_acceleration = std::max(max_acceleration, continuous_trajectory_.getAcc(std::min(time, duration)).norm());
+    minimum_clearance = std::min(minimum_clearance,
+      static_cast<double>(grid_map_.clearanceAt(grid_map_.worldToGrid(position))));
+  }
+  const double total_ms = std::chrono::duration<double, std::milli>(
+    std::chrono::steady_clock::now() - total_begin).count();
   RCLCPP_INFO(
     node_->get_logger(), "Plan published: route_points=%zu segments=%d duration=%.3f s",
     route_sampled.size(), output_candidate.segment_count,
     continuous_trajectory_.getTotalDuration());
+  RCLCPP_INFO(node_->get_logger(),
+    "metrics search=%.2fms corridor=%.2fms minco=%.2fms total=%.2fms path=%.3fm clearance=%.3fm vmax=%.3fm/s amax=%.3fm/s2",
+    search_ms, corridor_ms, minco_ms, total_ms, path_length, minimum_clearance,
+    max_velocity, max_acceleration);
   return true;
 }
 
@@ -341,7 +444,7 @@ bool GlobalPlanner::buildContinuousTrajectory(
 
 
   // ============================================================
-  // TODO(阶段② 具体轨迹解算)
+  // Build the continuous quintic trajectory with the existing MINCO_S3NU solver.
   // 在这里接入连续轨迹求解器，并生成可按时间查询的位置和各阶导数。
   // 当前基线使用 MINCO_S3NU 解算五次多项式轨迹。
   // ============================================================
@@ -368,7 +471,8 @@ bool GlobalPlanner::buildContinuousTrajectory(
 
 bool GlobalPlanner::hasTrajectoryCollision(
   const Trajectory<5, 2> & trajectory,
-  double start_time) const
+  double start_time,
+  double horizon) const
 {
   // 以固定时间间隔查询连续轨迹位置。
   constexpr double kCheckDt = 0.02;
@@ -381,7 +485,8 @@ bool GlobalPlanner::hasTrajectoryCollision(
     return true;
   }
   const double begin = std::clamp(start_time, 0.0, total_duration);
-  const double remaining = total_duration - begin;
+  const double end = std::min(total_duration, begin + std::max(0.0, horizon));
+  const double remaining = end - begin;
   const double requested_samples = std::ceil(remaining / kCheckDt) + 1.0;
   if (!std::isfinite(requested_samples) || requested_samples > kMaxCollisionSamples) {
     return true;
@@ -389,15 +494,51 @@ bool GlobalPlanner::hasTrajectoryCollision(
 
   const size_t sample_count = static_cast<size_t>(requested_samples);
   for (size_t index = 0; index < sample_count; ++index) {
-    const double time = std::min(total_duration, begin + static_cast<double>(index) * kCheckDt);
+    const double time = std::min(end, begin + static_cast<double>(index) * kCheckDt);
     const Eigen::Vector2d position = trajectory.getPos(time).head<2>();
     if (!position.allFinite() || grid_map_.isOccupied(grid_map_.worldToGrid(position))) {
       return true;
     }
   }
-  const Eigen::Vector2d final_position = trajectory.getPos(total_duration).head<2>();
+  const Eigen::Vector2d final_position = trajectory.getPos(end).head<2>();
   return !final_position.allFinite() ||
     grid_map_.isOccupied(grid_map_.worldToGrid(final_position));
+}
+
+bool GlobalPlanner::hasDynamicObstacleConflict(
+  const Trajectory<5, 2> & trajectory,
+  double start_time,
+  double now_seconds) const
+{
+  if (trajectory.getPieceNum() <= 0 || !std::isfinite(start_time) ||
+    !std::isfinite(now_seconds))
+  {return true;}
+  const double message_stamp = rclcpp::Time(dynamic_obstacles_.header.stamp).seconds();
+  const double age = std::max(0.0, now_seconds - message_stamp);
+  const double duration = trajectory.getTotalDuration();
+  const double end = std::min(duration, start_time + config_.prediction_horizon);
+  for (const auto & obstacle : dynamic_obstacles_.obstacles) {
+    const double validity = obstacle.valid_for > 0.0 ?
+      std::min(config_.dynamic_obstacle_timeout, obstacle.valid_for) :
+      config_.dynamic_obstacle_timeout;
+    if (age > validity) {continue;}
+    const double obstacle_radius = obstacle.shape ==
+      plan_interfaces::msg::DynamicObstacle::SHAPE_BOX ?
+      0.5 * std::hypot(obstacle.size.x, obstacle.size.y) : obstacle.radius;
+    const double safety_radius = obstacle_radius + config_.robot_radius_normal +
+      config_.static_safety_margin + config_.dynamic_safety_margin;
+    for (double trajectory_time = start_time; trajectory_time <= end; trajectory_time += 0.02) {
+      const double future = age + trajectory_time - start_time;
+      const Eigen::Vector2d predicted(
+        obstacle.position.x + obstacle.velocity.x * future,
+        obstacle.position.y + obstacle.velocity.y * future);
+      const Eigen::Vector2d robot = trajectory.getPos(trajectory_time).head<2>();
+      if (!predicted.allFinite() || !robot.allFinite() ||
+        (predicted - robot).squaredNorm() <= safety_radius * safety_radius)
+      {return true;}
+    }
+  }
+  return false;
 }
 
 void GlobalPlanner::updateWaypointSpaciousFlags(MincoTrajectoryData & trajectory_data) const
@@ -412,7 +553,7 @@ void GlobalPlanner::updateWaypointSpaciousFlags(MincoTrajectoryData & trajectory
 
 
   // ============================================================
-  // TODO(阶段③ 25 cm 狗洞标志)
+  // Mark intermediate points using the cross-hole semantic layer.
   // 在这里设计考虑过洞问题，当一段轨迹真正要过洞时，合理标记轨迹使其
   // 当前基线只将连接点标记为宽阔区域。
   // ============================================================
@@ -429,9 +570,62 @@ void GlobalPlanner::updateWaypointSpaciousFlags(MincoTrajectoryData & trajectory
 
 
   
-  trajectory_data.waypoint_is_spacious.resize(
-    trajectory_data.intermediate_positions.cols());
-  trajectory_data.waypoint_is_spacious.setOnes();
+  trajectory_data.waypoint_is_spacious.resize(trajectory_data.intermediate_positions.cols());
+  for (Eigen::Index index = 0; index < trajectory_data.intermediate_positions.cols(); ++index) {
+    const Eigen::Vector2d point = trajectory_data.intermediate_positions.col(index);
+    trajectory_data.waypoint_is_spacious(index) =
+      grid_map_.semanticAt(grid_map_.worldToGrid(point)) == MapSemantic::CROSS_HOLE ? 0 : 1;
+  }
+}
+
+void GlobalPlanner::extractCrossHoleIntervals(
+  const Trajectory<5, 2> & trajectory,
+  MincoTrajectoryData & trajectory_data) const
+{
+  trajectory_data.cross_hole_intervals.clear();
+  if (!grid_map_.valid() || trajectory.getPieceNum() <= 0) {return;}
+  const double duration = trajectory.getTotalDuration();
+  const double dt = std::min(0.02, std::max(0.002, grid_map_.resolution /
+    std::max(config_.optimization.max_velocity, 1.0e-3) * 0.5));
+  bool inside = false;
+  double enter_time = 0.0;
+  for (double time = 0.0; time <= duration + 0.5 * dt; time += dt) {
+    const double sample_time = std::min(time, duration);
+    const Eigen::Vector2d position = trajectory.getPos(sample_time).head<2>();
+    const bool current_inside = grid_map_.semanticAt(grid_map_.worldToGrid(position)) ==
+      MapSemantic::CROSS_HOLE;
+    if (current_inside && !inside) {
+      enter_time = sample_time;
+    } else if (!current_inside && inside) {
+      MincoTrajectoryData::CrossHoleInterval interval;
+      interval.enter_time = enter_time;
+      interval.exit_time = sample_time;
+      interval.active_start_time = std::max(0.0,
+        enter_time - config_.cross_hole_prepare_time - config_.cross_hole_time_margin);
+      interval.active_end_time = std::min(duration,
+        sample_time + config_.cross_hole_recovery_time + config_.cross_hole_time_margin);
+      interval.black_pixel_count = 0;
+      if (interval.exit_time > interval.enter_time &&
+        interval.active_end_time > interval.active_start_time)
+      {
+        trajectory_data.cross_hole_intervals.push_back(interval);
+      }
+    }
+    inside = current_inside;
+  }
+  if (inside) {
+    MincoTrajectoryData::CrossHoleInterval interval;
+    interval.enter_time = enter_time;
+    interval.exit_time = duration;
+    interval.active_start_time = std::max(0.0,
+      enter_time - config_.cross_hole_prepare_time - config_.cross_hole_time_margin);
+    interval.active_end_time = duration;
+    if (interval.exit_time > interval.enter_time &&
+      interval.active_end_time > interval.active_start_time)
+    {
+      trajectory_data.cross_hole_intervals.push_back(interval);
+    }
+  }
 }
 
 void GlobalPlanner::publishMincoTrajectory(const MincoTrajectoryData & trajectory_data)
@@ -597,7 +791,7 @@ void GlobalPlanner::FSMCallBack_Timer()
 
 
   // ============================================================
-  // TODO(阶段④ 动态障碍与实时重规划)
+  // Replan only when a changed map or predicted obstacle conflicts with the horizon.
   // 在这里扩展有限状态机、动态障碍预测、重规划滞回和规划失败处理。
   // 当前基线在新地图与剩余轨迹冲突时触发一次重新规划。
   // ============================================================
@@ -613,11 +807,21 @@ void GlobalPlanner::FSMCallBack_Timer()
   const bool goal_event = goal_changed_;
   bool map_requires_replan = false;
   if (map_changed_ && have_plan_) {
-    map_requires_replan = hasTrajectoryCollision(continuous_trajectory_, current_sample_time);
+    const bool cooldown_elapsed =
+      (now_seconds - last_replan_time_) * 1000.0 >= config_.replan_cooldown_ms;
+    map_requires_replan = cooldown_elapsed && hasTrajectoryCollision(
+      continuous_trajectory_, current_sample_time, config_.prediction_horizon);
   }
   if (map_changed_) {
     map_changed_ = false;
   }
+  if (dynamic_obstacles_changed_ && have_plan_) {
+    const bool cooldown_elapsed =
+      (now_seconds - last_replan_time_) * 1000.0 >= config_.replan_cooldown_ms;
+    map_requires_replan = map_requires_replan || (cooldown_elapsed &&
+      hasDynamicObstacleConflict(continuous_trajectory_, current_sample_time, now_seconds));
+  }
+  dynamic_obstacles_changed_ = false;
   if (!goal_event && !map_requires_replan) {
     return;
   }
@@ -629,7 +833,16 @@ void GlobalPlanner::FSMCallBack_Timer()
   }
   const Eigen::Vector2d planning_goal = startGoal_[1];
   goal_changed_ = false;
-  plan(planning_start, planning_goal);
+  if (plan(planning_start, planning_goal, !goal_event && map_requires_replan)) {
+    last_replan_time_ = now_seconds;
+  } else if (map_requires_replan &&
+    (hasTrajectoryCollision(continuous_trajectory_, current_sample_time, config_.prediction_horizon) ||
+    hasDynamicObstacleConflict(continuous_trajectory_, current_sample_time, now_seconds)))
+  {
+    RCLCPP_ERROR(node_->get_logger(),
+      "Replanning failed and the retained trajectory is unsafe; controller must stop");
+    have_plan_ = false;
+  }
 }
 
 int main(int argc, char ** argv)

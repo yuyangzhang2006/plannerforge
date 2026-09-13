@@ -7,3 +7,4 @@
       image_origin_m: [-14.11, -7.61]
       image_resolution_m_per_pixel: 0.05
       map_resolution_m_per_cell: 0.05
+      generate_dynamic_obstacles: false
