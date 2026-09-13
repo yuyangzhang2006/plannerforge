@@ -123,6 +123,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /visualizer/trajectory
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: DynamicObstacles
+      Namespaces: {}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /visualizer/dynamic_obstacles
+      Value: true
     - Class: rviz_default_plugins/Marker
       Enabled: true
       Name: CurrentPosition

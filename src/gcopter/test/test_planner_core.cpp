@@ -97,6 +97,21 @@ TEST(SamplePath, PreservesTurnsAndSemanticBoundaries)
   }));
 }
 
+TEST(SamplePath, BoundsLongStraightSeedSpacing)
+{
+  GridMap2D map = makeMap(50, 10, 0.1);
+  std::vector<Eigen::Vector2d> input;
+  for (int x = 1; x <= 41; ++x) {input.push_back(map.gridToWorld({x, 2}));}
+  std::vector<Eigen::Vector2d> output;
+  ASSERT_TRUE(SamplePath(map, input, output));
+  ASSERT_GT(output.size(), 2U);
+  for (size_t index = 1; index < output.size(); ++index) {
+    const Eigen::Vector2i previous = map.worldToGrid(output[index - 1]);
+    const Eigen::Vector2i current = map.worldToGrid(output[index]);
+    EXPECT_LE((current - previous).cwiseAbs().maxCoeff(), 10);
+  }
+}
+
 TEST(Corridor, HasAreaOverlapAtNinetyDegreeTurn)
 {
   const GridMap2D map = makeMap(40, 40, 0.1);
@@ -109,6 +124,25 @@ TEST(Corridor, HasAreaOverlapAtNinetyDegreeTurn)
   ASSERT_EQ(corridors.size(), 2U);
   EXPECT_TRUE(corridors[0].contains({2.0, 0.54}));
   EXPECT_TRUE(corridors[1].contains({2.0, 0.54}));
+}
+
+TEST(Corridor, AcceptsAsymmetricAreaOverlapAtBlockedTurn)
+{
+  GridMap2D map = makeMap(30, 30, 0.1);
+  // Obstacles immediately beyond the incoming segment and behind the outgoing
+  // segment force the overlap into just the free upper-left quadrant.
+  map.raw_occupancy[static_cast<size_t>(map.index({11, 5}))] = 100U;
+  map.raw_occupancy[static_cast<size_t>(map.index({10, 4}))] = 100U;
+  rebuild(map);
+  const std::vector<Eigen::Vector2d> path{{0.55, 0.55}, {1.05, 0.55}, {1.05, 1.05}};
+  CorridorOptions options;
+  options.minimum_overlap = 0.12;
+  std::vector<ConvexCorridor2D> corridors;
+  std::string reason;
+  ASSERT_TRUE(GenerateCorridor(map, path, options, corridors, reason)) << reason;
+  ASSERT_EQ(corridors.size(), 2U);
+  EXPECT_TRUE(corridors[0].contains({1.04, 0.56}));
+  EXPECT_TRUE(corridors[1].contains({1.04, 0.56}));
 }
 
 TEST(Trajectory, PreservesNonZeroReplanBoundaryState)
@@ -145,4 +179,24 @@ TEST(Trajectory, MincoOptimizationRespectsPlanningEnvelope)
   EXPECT_EQ(optimized.segment_count, 2);
   EXPECT_TRUE(optimized.segment_durations.allFinite());
   EXPECT_TRUE((optimized.segment_durations.array() >= 0.1).all());
+}
+
+TEST(Trajectory, SafeInitialFallbackUsesTimeScalingWithoutMovingWaypoints)
+{
+  const GridMap2D map = makeMap(60, 30, 0.1);
+  const std::vector<Eigen::Vector2d> path{{0.5, 0.8}, {1.5, 0.8}, {2.5, 1.2}};
+  std::vector<ConvexCorridor2D> corridors;
+  std::string reason;
+  ASSERT_TRUE(GenerateCorridor(map, path, CorridorOptions(), corridors, reason)) << reason;
+  MincoTrajectoryData initial;
+  const Eigen::Matrix<double, 2, 3> zero_pva = Eigen::Matrix<double, 2, 3>::Zero();
+  ASSERT_TRUE(GenerateTrajectory(path, corridors, 2.0, 0.05, zero_pva, initial));
+
+  OptimizationOptions options;
+  options.max_velocity = 0.35;
+  options.max_acceleration = 0.45;
+  MincoTrajectoryData fallback;
+  ASSERT_TRUE(PrepareSafeInitialTrajectory(map, initial, options, fallback, &reason)) << reason;
+  EXPECT_TRUE(fallback.intermediate_positions.isApprox(initial.intermediate_positions));
+  EXPECT_TRUE((fallback.segment_durations.array() >= initial.segment_durations.array()).all());
 }

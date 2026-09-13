@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,8 @@ struct Evaluation
   double objective = std::numeric_limits<double>::infinity();
   double maximum_velocity = 0.0;
   double maximum_acceleration = 0.0;
+  double maximum_corridor_violation = 0.0;
+  int occupied_samples = 0;
   bool corridor_safe = false;
 };
 
@@ -66,6 +69,7 @@ Evaluation evaluate(
   if (!std::isfinite(jerk_energy) || trajectory.getPieceNum() != data.segment_count) {
     return result;
   }
+  result.corridor_safe = true;
 
   double velocity_penalty = 0.0;
   double acceleration_penalty = 0.0;
@@ -87,15 +91,29 @@ Evaluation evaluate(
       const double acceleration_excess = std::max(0.0, acceleration - options.max_acceleration);
       velocity_penalty += velocity_excess * velocity_excess * duration / kSamplesPerPiece;
       acceleration_penalty += acceleration_excess * acceleration_excess * duration / kSamplesPerPiece;
-      if (map.isOccupied(map.worldToGrid(position))) {corridor_penalty += 1.0;}
-      if (piece >= static_cast<int>(data.corridors.size()) ||
-        !data.corridors[static_cast<size_t>(piece)].contains(position, 1.0e-6))
-      {
+      if (map.isOccupied(map.worldToGrid(position))) {
         corridor_penalty += 1.0;
+        ++result.occupied_samples;
+        result.corridor_safe = false;
+      }
+      if (piece >= static_cast<int>(data.corridors.size())) {
+        corridor_penalty += 1.0;
+        result.corridor_safe = false;
+      } else {
+        const ConvexCorridor2D & corridor = data.corridors[static_cast<size_t>(piece)];
+        const double violation = std::max(0.0, (corridor.A * position - corridor.b).maxCoeff());
+        result.maximum_corridor_violation = std::max(
+          result.maximum_corridor_violation, violation);
+        if (violation > 1.0e-6) {
+          // A continuous metric gives coordinate descent a useful direction;
+          // the former binary sample count was flat almost everywhere.
+          const double normalized = violation / std::max(map.resolution, 1.0e-6);
+          corridor_penalty += normalized * normalized;
+          result.corridor_safe = false;
+        }
       }
     }
   }
-  result.corridor_safe = corridor_penalty == 0.0;
   result.objective = jerk_energy + options.weight_time * data.segment_durations.sum() +
     options.weight_velocity * velocity_penalty +
     options.weight_acceleration * acceleration_penalty + 1.0e8 * corridor_penalty;
@@ -114,7 +132,9 @@ bool SamplePath(
   for (const Eigen::Vector2d & point : input) {
     if (!point.allFinite() || !map.isInside(map.worldToGrid(point))) {return false;}
   }
-  output.push_back(input.front());
+  std::vector<uint8_t> keep(input.size(), 0U);
+  keep.front() = 1U;
+  keep.back() = 1U;
   Eigen::Vector2i previous_direction = discreteDirection(map, input[0], input[1]);
   for (size_t index = 1; index + 1 < input.size(); ++index) {
     const Eigen::Vector2i next_direction = discreteDirection(map, input[index], input[index + 1]);
@@ -122,11 +142,33 @@ bool SamplePath(
     const MapSemantic current = map.semanticAt(map.worldToGrid(input[index]));
     const MapSemantic after = map.semanticAt(map.worldToGrid(input[index + 1]));
     if (next_direction != previous_direction || current != before || current != after) {
-      if ((input[index] - output.back()).norm() > 1.0e-8) {output.push_back(input[index]);}
+      keep[index] = 1U;
     }
     previous_direction = next_direction;
   }
-  if ((input.back() - output.back()).norm() > 1.0e-8) {output.push_back(input.back());}
+
+  // Bound the distance between retained seeds. Very long straight pieces next
+  // to a short corner piece create extreme duration ratios and can make the
+  // global minimum-jerk interpolant overshoot by metres. Ten grid steps keep
+  // the representation sparse while giving MINCO well-scaled local support.
+  constexpr size_t kMaximumSeedSteps = 10;
+  size_t last_kept = 0;
+  for (size_t index = 1; index < input.size(); ++index) {
+    if (keep[index] == 0U) {continue;}
+    while (index - last_kept > kMaximumSeedSteps) {
+      last_kept += kMaximumSeedSteps;
+      keep[last_kept] = 1U;
+    }
+    last_kept = index;
+  }
+  output.reserve(input.size());
+  for (size_t index = 0; index < input.size(); ++index) {
+    if (keep[index] != 0U &&
+      (output.empty() || (input[index] - output.back()).norm() > 1.0e-8))
+    {
+      output.push_back(input[index]);
+    }
+  }
   return output.size() >= 2;
 }
 
@@ -168,6 +210,26 @@ bool GenerateTrajectory(
     if (length <= kDuplicateEps) {output.clear(); return false;}
     output.segment_durations(index) = std::max(minimum_segment_duration, length / nominal_speed);
   }
+  // Prevent a long straight piece beside a grid-sized corner piece from
+  // dominating the global quintic derivative solution. Only lengthen the
+  // shorter duration, which slows the vehicle near turns without weakening
+  // the nominal-speed or minimum-duration constraints.
+  constexpr double kMaximumAdjacentDurationRatio = 2.0;
+  for (int pass = 0; pass < segment_count; ++pass) {
+    bool changed = false;
+    for (int index = 1; index < segment_count; ++index) {
+      double & previous = output.segment_durations(index - 1);
+      double & current = output.segment_durations(index);
+      if (current > kMaximumAdjacentDurationRatio * previous) {
+        previous = current / kMaximumAdjacentDurationRatio;
+        changed = true;
+      } else if (previous > kMaximumAdjacentDurationRatio * current) {
+        current = previous / kMaximumAdjacentDurationRatio;
+        changed = true;
+      }
+    }
+    if (!changed) {break;}
+  }
   std::string reason;
   return ValidateTrajectoryData(output, reason);
 }
@@ -176,9 +238,11 @@ bool OptimizeTrajectory(
   const GridMap2D & map,
   const MincoTrajectoryData & input,
   const OptimizationOptions & options,
-  MincoTrajectoryData & output)
+  MincoTrajectoryData & output,
+  std::string * failure_reason)
 {
   output.clear();
+  if (failure_reason != nullptr) {failure_reason->clear();}
   std::string reason;
   if (!map.valid() || !ValidateTrajectoryData(input, reason) ||
     input.corridors.size() != static_cast<size_t>(input.segment_count) ||
@@ -188,24 +252,28 @@ bool OptimizeTrajectory(
     options.maximum_iterations <= 0 || !std::isfinite(options.time_budget_ms) ||
     options.time_budget_ms <= 0.0)
   {
+    if (failure_reason != nullptr) {*failure_reason = "invalid_input";}
     return false;
   }
   output = input;
-  const auto deadline = std::chrono::steady_clock::now() +
-    std::chrono::duration<double, std::milli>(options.time_budget_ms);
-
   // Establish a feasible planning envelope first. Uniform time scaling preserves
-  // the spatial curve and monotonically reduces velocity and acceleration.
+  // the spatial curve and monotonically reduces velocity and acceleration. Run
+  // this bounded mandatory phase before the discretionary optimization budget.
   Evaluation current = evaluate(map, output, options);
-  for (int pass = 0; pass < 8 && std::chrono::steady_clock::now() < deadline; ++pass) {
+  for (int pass = 0; pass < 8; ++pass) {
     const double scale = std::max({1.0,
       current.maximum_velocity / options.max_velocity,
       std::sqrt(current.maximum_acceleration / options.max_acceleration)});
-    if (!std::isfinite(scale)) {return false;}
+    if (!std::isfinite(scale)) {
+      if (failure_reason != nullptr) {*failure_reason = "nonfinite_time_scale";}
+      return false;
+    }
     if (scale <= 1.001) {break;}
     output.segment_durations *= std::min(4.0, scale * 1.01);
     current = evaluate(map, output, options);
   }
+  const auto deadline = std::chrono::steady_clock::now() +
+    std::chrono::duration<double, std::milli>(options.time_budget_ms);
 
   // Bounded projected coordinate descent. Every intermediate point remains in
   // the ordered overlap of its adjacent corridors; durations remain positive.
@@ -247,18 +315,23 @@ bool OptimizeTrajectory(
     for (int segment = 0; segment < output.segment_count &&
       std::chrono::steady_clock::now() < deadline; ++segment)
     {
-      MincoTrajectoryData candidate = output;
-      candidate.segment_durations(segment) = std::max(options.minimum_segment_duration,
-        0.95 * candidate.segment_durations(segment));
-      if (candidate.segment_durations(segment) < output.segment_durations(segment) - 1.0e-9) {
-        const Evaluation trial = evaluate(map, candidate, options);
-        if (trial.corridor_safe && trial.maximum_velocity <= options.max_velocity * 1.01 &&
-          trial.maximum_acceleration <= options.max_acceleration * 1.01 &&
-          trial.objective + 1.0e-9 < current.objective)
+      for (const double factor : {0.95, 1.05}) {
+        MincoTrajectoryData candidate = output;
+        candidate.segment_durations(segment) = std::max(options.minimum_segment_duration,
+          factor * candidate.segment_durations(segment));
+        if (std::abs(candidate.segment_durations(segment) - output.segment_durations(segment)) >
+          1.0e-9)
         {
-          output = std::move(candidate);
-          current = trial;
-          improved = true;
+          const Evaluation trial = evaluate(map, candidate, options);
+          const bool limits_ok = trial.maximum_velocity <= options.max_velocity * 1.01 &&
+            trial.maximum_acceleration <= options.max_acceleration * 1.01;
+          if (trial.objective + 1.0e-9 < current.objective &&
+            (!current.corridor_safe || (trial.corridor_safe && limits_ok)))
+          {
+            output = std::move(candidate);
+            current = trial;
+            improved = true;
+          }
         }
       }
     }
@@ -267,10 +340,90 @@ bool OptimizeTrajectory(
   }
 
   current = evaluate(map, output, options);
+  // Spatial waypoint updates can improve jerk while raising derivatives again.
+  // Restore the hard planning envelope once more; uniform scaling leaves the
+  // already verified spatial curve and corridor membership unchanged.
+  for (int pass = 0; pass < 8; ++pass) {
+    const double scale = std::max({1.0,
+      current.maximum_velocity / options.max_velocity,
+      std::sqrt(current.maximum_acceleration / options.max_acceleration)});
+    if (!std::isfinite(scale)) {
+      if (failure_reason != nullptr) {*failure_reason = "nonfinite_final_time_scale";}
+      return false;
+    }
+    if (scale <= 1.001) {break;}
+    output.segment_durations *= std::min(4.0, scale * 1.01);
+    current = evaluate(map, output, options);
+  }
   const bool envelope_ok = current.maximum_velocity <= options.max_velocity * 1.01 &&
     current.maximum_acceleration <= options.max_acceleration * 1.01;
-  return std::isfinite(current.objective) && current.corridor_safe && envelope_ok &&
-    ValidateTrajectoryData(output, reason);
+  const bool valid = ValidateTrajectoryData(output, reason);
+  const bool success = std::isfinite(current.objective) && current.corridor_safe &&
+    envelope_ok && valid;
+  if (!success && failure_reason != nullptr) {
+    std::ostringstream stream;
+    stream << "safe=" << (current.corridor_safe ? "true" : "false")
+           << " max_corridor_violation=" << current.maximum_corridor_violation
+           << " occupied_samples=" << current.occupied_samples
+           << " vmax=" << current.maximum_velocity
+           << " amax=" << current.maximum_acceleration;
+    if (!valid) {stream << " validation=" << reason;}
+    *failure_reason = stream.str();
+  }
+  return success;
+}
+
+bool PrepareSafeInitialTrajectory(
+  const GridMap2D & map,
+  const MincoTrajectoryData & input,
+  const OptimizationOptions & options,
+  MincoTrajectoryData & output,
+  std::string * failure_reason)
+{
+  output.clear();
+  if (failure_reason != nullptr) {failure_reason->clear();}
+  std::string validation_reason;
+  if (!map.valid() || !ValidateTrajectoryData(input, validation_reason) ||
+    input.corridors.size() != static_cast<size_t>(input.segment_count) ||
+    !std::isfinite(options.max_velocity) || options.max_velocity <= 0.0 ||
+    !std::isfinite(options.max_acceleration) || options.max_acceleration <= 0.0)
+  {
+    if (failure_reason != nullptr) {
+      *failure_reason = validation_reason.empty() ? "invalid_input" : validation_reason;
+    }
+    return false;
+  }
+
+  output = input;
+  Evaluation evaluation = evaluate(map, output, options);
+  // 统一延长全部分段只改变时间参数，不改变空间曲线，因此不会破坏已经满足的
+  // corridor 和碰撞条件，同时会单调降低速度与加速度。
+  for (int pass = 0; pass < 8; ++pass) {
+    const double scale = std::max({1.0,
+      evaluation.maximum_velocity / options.max_velocity,
+      std::sqrt(evaluation.maximum_acceleration / options.max_acceleration)});
+    if (!std::isfinite(scale)) {break;}
+    if (scale <= 1.001) {break;}
+    output.segment_durations *= std::min(4.0, scale * 1.01);
+    evaluation = evaluate(map, output, options);
+  }
+
+  const bool envelope_ok = evaluation.maximum_velocity <= options.max_velocity * 1.01 &&
+    evaluation.maximum_acceleration <= options.max_acceleration * 1.01;
+  const bool valid = ValidateTrajectoryData(output, validation_reason);
+  const bool success = std::isfinite(evaluation.objective) && evaluation.corridor_safe &&
+    envelope_ok && valid;
+  if (!success && failure_reason != nullptr) {
+    std::ostringstream stream;
+    stream << "safe=" << (evaluation.corridor_safe ? "true" : "false")
+           << " max_corridor_violation=" << evaluation.maximum_corridor_violation
+           << " occupied_samples=" << evaluation.occupied_samples
+           << " vmax=" << evaluation.maximum_velocity
+           << " amax=" << evaluation.maximum_acceleration;
+    if (!valid) {stream << " validation=" << validation_reason;}
+    *failure_reason = stream.str();
+  }
+  return success;
 }
 
 bool ValidateTrajectoryData(const MincoTrajectoryData & input, std::string & reason)

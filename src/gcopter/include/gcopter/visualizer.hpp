@@ -3,9 +3,11 @@
 #include "gcopter/trajectory.hpp"
 
 #include <geometry_msgs/msg/point.hpp>
+#include <plan_interfaces/msg/dynamic_obstacle_array.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -28,6 +30,9 @@ public:
       "/visualizer/route", result_qos);
     trajectory_pub_ = node_->create_publisher<visualization_msgs::msg::Marker>(
       "/visualizer/trajectory", result_qos);
+    dynamic_obstacles_pub_ =
+      node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/visualizer/dynamic_obstacles", result_qos);
 
     rclcpp::QoS current_qos(rclcpp::KeepLast(1));
     current_qos.reliable();
@@ -95,6 +100,14 @@ public:
     trajectory_pub_->publish(marker);
   }
 
+  // 清除上一条蓝色连续轨迹，避免后端失败时把旧轨迹误认为本次结果。
+  void clearTrajectory() const
+  {
+    auto marker = makeMarker("trajectory", visualization_msgs::msg::Marker::LINE_STRIP);
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    trajectory_pub_->publish(marker);
+  }
+
   // 发布 odom 或轨迹时间推进得到的当前位置。
   void visualizeCurrentPosition(const Eigen::Vector2d & position) const
   {
@@ -110,6 +123,35 @@ public:
     marker.color.b = 0.95F;
     marker.color.a = 1.0F;
     current_position_pub_->publish(marker);
+  }
+
+  void visualizeDynamicObstacles(
+    const plan_interfaces::msg::DynamicObstacleArray & obstacles) const
+  {
+    visualization_msgs::msg::MarkerArray array;
+    auto clear = makeMarker("dynamic_obstacles", visualization_msgs::msg::Marker::CUBE);
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    array.markers.push_back(clear);
+    for (size_t index = 0; index < obstacles.obstacles.size(); ++index) {
+      const auto & obstacle = obstacles.obstacles[index];
+      const bool circle = obstacle.shape == plan_interfaces::msg::DynamicObstacle::SHAPE_CIRCLE;
+      auto marker = makeMarker(
+        "dynamic_obstacles",
+        circle ? visualization_msgs::msg::Marker::CYLINDER :
+        visualization_msgs::msg::Marker::CUBE);
+      marker.id = static_cast<int>(index + 1);
+      marker.pose.position = obstacle.position;
+      marker.pose.position.z = 0.18;
+      marker.scale.x = circle ? 2.0 * obstacle.radius : obstacle.size.x;
+      marker.scale.y = circle ? 2.0 * obstacle.radius : obstacle.size.y;
+      marker.scale.z = 0.36;
+      marker.color.r = 1.0F;
+      marker.color.g = 0.25F;
+      marker.color.b = 0.05F;
+      marker.color.a = 0.85F;
+      array.markers.push_back(marker);
+    }
+    dynamic_obstacles_pub_->publish(array);
   }
 
 private:
@@ -141,5 +183,6 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr start_goal_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr route_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr trajectory_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_obstacles_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr current_position_pub_;
 };

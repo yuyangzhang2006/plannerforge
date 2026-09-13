@@ -1,7 +1,10 @@
 # PlannerForge
 
-Planner parameters, runtime behavior, and current implementation limits are
-documented in [docs/planner_parameters.md](docs/planner_parameters.md).
+规划参数、运行行为和当前实现限制见
+[规划参数说明](docs/planner_parameters.md)。
+
+每次实现迭代、问题根因和实测结果记录在
+[开发日志](docs/DEVELOPMENT_LOG.md)中。
 
 PlannerForge 是一个二维导航规划框架。当前版本包含地图读取、栅格搜索、轨迹生成、MINCO 解算和 RViz 显示，可以单独构建运行。
 
@@ -39,6 +42,8 @@ ros2 launch gcopter planner_forge.launch.py
 ```
 
 启动后会打开 RViz。默认 `is_plan_from_ego_pose: false`，第一次使用 `2D Goal Pose` 设置起点，第二次设置终点。规划结果会显示离散路径、连续轨迹和沿轨迹推进的当前位置。
+
+规划采用分级保底发布：前端 A* 成功后会立即发布黄色离散路径；后端优化失败时优先发布经过硬安全校验的未优化 MINCO 轨迹；若无法生成可安全执行的连续轨迹，则仍保留黄色路径，并在 `/planner/status` 中标明当前完成层级和不可直接执行的原因。标准离散路径同时发布在 `/planner/path`。
 
 启用示例动态障碍：
 

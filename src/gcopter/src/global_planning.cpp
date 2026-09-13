@@ -89,6 +89,14 @@ GlobalPlanner::GlobalPlanner(const Config & config, const rclcpp::Node::SharedPt
   traj_pub_ = node_->create_publisher<plan_interfaces::msg::MincoTrajectory>(
     "/minco_trajectory", trajectory_qos);
 
+  rclcpp::QoS planning_result_qos(rclcpp::KeepLast(1));
+  planning_result_qos.reliable();
+  planning_result_qos.transient_local();
+  planning_path_pub_ = node_->create_publisher<nav_msgs::msg::Path>(
+    "/planner/path", planning_result_qos);
+  planning_status_pub_ = node_->create_publisher<std_msgs::msg::String>(
+    "/planner/status", planning_result_qos);
+
   if (!config_.is_plan_from_ego_pose && config_.publish_trajectory_odom) {
     trajectory_odom_pub_ = node_->create_publisher<nav_msgs::msg::Odometry>(
       config_.odomTopic, rclcpp::SensorDataQoS());
@@ -301,6 +309,7 @@ void GlobalPlanner::dynamicObstacleCallBack(
   }
   dynamic_obstacles_ = *msg;
   dynamic_obstacles_changed_ = true;
+  visualizer_.visualizeDynamicObstacles(dynamic_obstacles_);
 }
 
 bool GlobalPlanner::FrontSearch(
@@ -330,27 +339,55 @@ bool GlobalPlanner::plan(
 
   const auto search_begin = std::chrono::steady_clock::now();
   if (!FrontSearch(start, goal, route_raw)) {
-    RCLCPP_WARN(node_->get_logger(), "Planning failed at FrontSearch");
+    publishPlanningPath({});
+    publishPlanningStatus("FAILED_NO_PATH", false, "前端 A* 未找到可行路径");
+    RCLCPP_WARN(node_->get_logger(), "规划失败：前端 A* 未找到可行路径");
+    if (!preserve_current_state) {
+      have_plan_ = false;
+      continuous_trajectory_.clear();
+      visualizer_.clearTrajectory();
+    }
     return false;
   }
   const double search_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - search_begin).count();
+  // 前端一成功就立即发布。后端即使耗时或失败，用户和上层仍能取得一条
+  // 经过硬膨胀地图验证的可行离散路径。
+  visualizer_.visualizeStartGoal(start, goal);
+  visualizer_.visualizeRoute(route_raw);
+  publishPlanningPath(route_raw);
+  publishPlanningStatus("FRONTEND_PATH_READY", false, "前端路径已发布，后端继续处理中");
   if (!SamplePath(grid_map_, route_raw, route_sampled)) {
-    RCLCPP_WARN(node_->get_logger(), "Planning failed at SamplePath");
-    return false;
+    route_sampled = route_raw;
+    RCLCPP_WARN(node_->get_logger(), "路径稀疏化失败，保留完整前端 A* 路径继续处理");
   }
+  visualizer_.visualizeRoute(route_sampled);
+  publishPlanningPath(route_sampled);
   const auto corridor_begin = std::chrono::steady_clock::now();
   if (!GenerateCorridor(grid_map_, route_sampled, config_.corridor, corridors, reason)) {
     // Conservative recovery: restore the front-end grid points and retry without
     // changing the selected topological route or rerunning A*.
     route_sampled = route_raw;
+    visualizer_.visualizeRoute(route_sampled);
+    publishPlanningPath(route_sampled);
     if (!GenerateCorridor(grid_map_, route_sampled, config_.corridor, corridors, reason)) {
-      RCLCPP_WARN(node_->get_logger(), "Planning failed at GenerateCorridor: %s", reason.c_str());
+      publishPlanningStatus(
+        "FRONTEND_PATH_ONLY", false, "corridor 生成失败：" + reason);
+      RCLCPP_WARN(
+        node_->get_logger(),
+        "已降级为仅发布前端路径：corridor 生成失败：%s", reason.c_str());
+      if (!preserve_current_state) {
+        have_plan_ = false;
+        continuous_trajectory_.clear();
+        visualizer_.clearTrajectory();
+      }
       return false;
     }
   }
   const double corridor_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - corridor_begin).count();
+  publishPlanningStatus(
+    "CORRIDOR_PATH_READY", false, "前端路径与安全 corridor 已生成，轨迹后端继续处理中");
 
   Eigen::Matrix<double, 2, 3> start_pva = Eigen::Matrix<double, 2, 3>::Zero();
   if (preserve_current_state && have_plan_) {
@@ -364,28 +401,68 @@ bool GlobalPlanner::plan(
   if (!GenerateTrajectory(route_sampled, corridors, config_.nominal_velocity,
       config_.min_segment_duration, start_pva, initial_candidate))
   {
-    RCLCPP_WARN(node_->get_logger(), "Planning failed at GenerateTrajectory");
+    publishPlanningStatus(
+      "CORRIDOR_PATH_ONLY", false, "初始 MINCO 数据生成失败，保留前端路径与 corridor");
+    RCLCPP_WARN(node_->get_logger(), "已降级为前端路径 + corridor：初始 MINCO 数据生成失败");
+    if (!preserve_current_state) {
+      have_plan_ = false;
+      continuous_trajectory_.clear();
+      visualizer_.clearTrajectory();
+    }
     return false;
   }
   updateWaypointSpaciousFlags(initial_candidate);
   const auto minco_begin = std::chrono::steady_clock::now();
-  if (!OptimizeTrajectory(grid_map_, initial_candidate, config_.optimization, output_candidate)) {
-    RCLCPP_WARN(node_->get_logger(), "Planning failed at OptimizeTrajectory");
-    return false;
+  MincoTrajectoryData safe_initial_candidate;
+  Trajectory<5, 2> safe_initial_trajectory;
+  std::string initial_reason;
+  bool safe_initial_available = PrepareSafeInitialTrajectory(
+    grid_map_, initial_candidate, config_.optimization, safe_initial_candidate, &initial_reason);
+  if (safe_initial_available) {
+    safe_initial_available = buildContinuousTrajectory(
+      safe_initial_candidate, safe_initial_trajectory) &&
+      !hasTrajectoryCollision(safe_initial_trajectory, 0.0);
+    if (!safe_initial_available) {
+      initial_reason = "保底初始轨迹的连续解算或硬碰撞检查失败";
+    }
   }
+
+  const bool optimization_succeeded = OptimizeTrajectory(
+    grid_map_, initial_candidate, config_.optimization, output_candidate, &reason);
   const double minco_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - minco_begin).count();
-  if (!ValidateTrajectoryData(output_candidate, reason)) {
-    RCLCPP_WARN(
-      node_->get_logger(), "Planning rejected backend output: %s", reason.c_str());
-    return false;
+  std::string result_level = "OPTIMIZED_MINCO";
+  std::string result_detail = "优化后的 MINCO 轨迹已通过全部检查";
+  bool optimized_usable = optimization_succeeded;
+  if (optimized_usable && !ValidateTrajectoryData(output_candidate, reason)) {
+    optimized_usable = false;
+    reason = "优化结果数据无效：" + reason;
   }
-  if (!buildContinuousTrajectory(output_candidate, trajectory_candidate)) {
-    RCLCPP_WARN(node_->get_logger(), "Planning failed while constructing continuous trajectory");
-    return false;
+  if (optimized_usable && !buildContinuousTrajectory(output_candidate, trajectory_candidate)) {
+    optimized_usable = false;
+    reason = "优化结果无法构造连续轨迹";
   }
-  if (hasTrajectoryCollision(trajectory_candidate, 0.0)) {
-    RCLCPP_WARN(node_->get_logger(), "Planning rejected continuous trajectory collision");
+  if (optimized_usable && hasTrajectoryCollision(trajectory_candidate, 0.0)) {
+    optimized_usable = false;
+    reason = "优化后的连续轨迹未通过硬碰撞检查";
+  }
+
+  if (!optimized_usable && safe_initial_available) {
+    output_candidate = safe_initial_candidate;
+    trajectory_candidate = safe_initial_trajectory;
+    result_level = "SAFE_INITIAL_MINCO";
+    result_detail = "优化阶段失败，已发布满足硬安全与运动包络的未优化 MINCO 轨迹：" + reason;
+    RCLCPP_WARN(node_->get_logger(), "%s", result_detail.c_str());
+  } else if (!optimized_usable) {
+    const std::string detail = "MINCO 后端失败（" + reason +
+      "），保底初始轨迹也不可用（" + initial_reason + "）";
+    publishPlanningStatus("CORRIDOR_PATH_ONLY", false, detail);
+    RCLCPP_WARN(node_->get_logger(), "已降级为前端路径 + corridor：%s", detail.c_str());
+    if (!preserve_current_state) {
+      have_plan_ = false;
+      continuous_trajectory_.clear();
+      visualizer_.clearTrajectory();
+    }
     return false;
   }
 
@@ -401,6 +478,8 @@ bool GlobalPlanner::plan(
   visualizer_.visualizeStartGoal(start, goal);
   visualizer_.visualizeRoute(route_sampled);
   visualizer_.visualizeTrajectory(continuous_trajectory_);
+  publishPlanningPath(route_sampled);
+  publishPlanningStatus(result_level, true, result_detail);
   double path_length = 0.0;
   for (size_t i = 1; i < route_raw.size(); ++i) {path_length += (route_raw[i] - route_raw[i - 1]).norm();}
   double max_velocity = 0.0;
@@ -417,8 +496,8 @@ bool GlobalPlanner::plan(
   const double total_ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - total_begin).count();
   RCLCPP_INFO(
-    node_->get_logger(), "Plan published: route_points=%zu segments=%d duration=%.3f s",
-    route_sampled.size(), output_candidate.segment_count,
+    node_->get_logger(), "规划结果已发布：level=%s route_points=%zu segments=%d duration=%.3f s",
+    result_level.c_str(), route_sampled.size(), output_candidate.segment_count,
     continuous_trajectory_.getTotalDuration());
   RCLCPP_INFO(node_->get_logger(),
     "metrics search=%.2fms corridor=%.2fms minco=%.2fms total=%.2fms path=%.3fm clearance=%.3fm vmax=%.3fm/s amax=%.3fm/s2",
@@ -626,6 +705,32 @@ void GlobalPlanner::extractCrossHoleIntervals(
       trajectory_data.cross_hole_intervals.push_back(interval);
     }
   }
+}
+
+void GlobalPlanner::publishPlanningPath(const std::vector<Eigen::Vector2d> & route)
+{
+  nav_msgs::msg::Path message;
+  message.header.stamp = node_->now();
+  message.header.frame_id = "map";
+  message.poses.reserve(route.size());
+  for (const Eigen::Vector2d & point : route) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = message.header;
+    pose.pose.position.x = point.x();
+    pose.pose.position.y = point.y();
+    pose.pose.orientation.w = 1.0;
+    message.poses.push_back(pose);
+  }
+  planning_path_pub_->publish(message);
+}
+
+void GlobalPlanner::publishPlanningStatus(
+  const std::string & level, bool executable, const std::string & detail)
+{
+  std_msgs::msg::String message;
+  message.data = "level=" + level + "; executable=" +
+    (executable ? std::string("true") : std::string("false")) + "; detail=" + detail;
+  planning_status_pub_->publish(message);
 }
 
 void GlobalPlanner::publishMincoTrajectory(const MincoTrajectoryData & trajectory_data)
@@ -842,6 +947,11 @@ void GlobalPlanner::FSMCallBack_Timer()
     RCLCPP_ERROR(node_->get_logger(),
       "Replanning failed and the retained trajectory is unsafe; controller must stop");
     have_plan_ = false;
+    continuous_trajectory_.clear();
+    visualizer_.clearTrajectory();
+    publishPlanningStatus(
+      "PATH_ONLY_STOP_REQUIRED", false,
+      "动态重规划只得到离散路径，旧轨迹已不安全，控制器必须停车");
   }
 }
 

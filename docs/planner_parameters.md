@@ -1,83 +1,70 @@
-# Planner implementation and parameters
+# 规划器实现与参数说明
 
-The existing `/goal_pose`, `/grid_map`, `/Odometry_to_base_link`, and
-`/minco_trajectory` interfaces are unchanged. The demo map node additionally
-publishes `/dynamic_obstacles` as `plan_interfaces/msg/DynamicObstacleArray` so
-the planner can perform constant-velocity prediction instead of inferring
-velocity from occupancy snapshots.
+现有的 `/goal_pose`、`/grid_map`、`/Odometry_to_base_link` 和 `/minco_trajectory` 接口保持不变。演示地图节点另外发布 `/dynamic_obstacles`，消息类型为 `plan_interfaces/msg/DynamicObstacleArray`，规划器据此进行匀速预测，而不是从占据栅格快照中推测障碍物速度。
 
-## Search and map
+## 搜索与地图
 
-- `RobotRadiusNormal`: ordinary-navigation footprint radius in metres.
-- `RobotRadiusCompact`: compact footprint radius used inside configured cross-hole regions.
-- `StaticSafetyMargin`: margin added to both footprint radii before hard inflation.
-- `TurnCostWeight`: equivalent-distance weight per radian of direction change.
-- `SafetyCostWeight`: soft-clearance penalty weight; zero disables the penalty.
-- `SafetyCostDistance`: clearance distance in metres at which the soft penalty becomes zero.
-- `SpecialRegionCostWeight`: additional equivalent-distance multiplier inside cross-hole cells.
-- `CrossHoleRegions`: flat `xmin,xmax,ymin,ymax` tuples in the map frame. Omit the parameter when no region is configured because ROS 2 does not accept an untyped empty YAML array.
+- `RobotRadiusNormal`：普通导航使用的机器人 footprint 半径，单位为米。
+- `RobotRadiusCompact`：狗洞区域内使用的紧凑 footprint 半径，单位为米。
+- `StaticSafetyMargin`：硬膨胀前叠加到两种 footprint 半径上的安全余量。
+- `TurnCostWeight`：每弧度方向变化对应的等价距离权重。
+- `SafetyCostWeight`：软净空代价权重；设为零时关闭该代价。
+- `SafetyCostDistance`：软净空代价衰减为零时的障碍物距离，单位为米。
+- `SpecialRegionCostWeight`：狗洞等特殊区域内的额外等价距离权重。
+- `CrossHoleRegions`：地图坐标系内的扁平数组，每四个数依次表示 `xmin,xmax,ymin,ymax`。没有狗洞区域时应省略此参数，因为 ROS 2 不接受无法推断类型的空 YAML 数组。
 
-The planner derives normal/compact hard occupancy and an 8-neighbour distance
-field from each `OccupancyGrid`. Unknown and non-zero cells are treated as
-occupied. Cross-hole regions use compact inflation but remain semantically
-labelled for search cost and interval extraction.
+规划器会根据每次收到的 `OccupancyGrid` 生成正常/紧凑两套硬占据层和八邻域距离场。未知栅格与非零栅格均视为占据。狗洞区域采用紧凑 footprint 膨胀，同时保留语义标签，供前端代价计算和穿越区间提取使用。
 
-## Corridor
+## 安全 corridor
 
-- `CorridorObstacleSearchRadius`: maximum local inflation extent in metres.
-- `CorridorFiriIterations`: bounded inflation passes; default `4`.
-- `CorridorMinOverlap`: required overlap seed diameter at route joints.
-- `CorridorMergeTolerance`: numerical half-space containment tolerance.
+- `CorridorObstacleSearchRadius`：局部膨胀的最大范围，单位为米。
+- `CorridorFiriIterations`：有界膨胀迭代次数，默认值为 `4`。
+- `CorridorMinOverlap`：路径关节处要求的重叠种子区域直径。
+- `CorridorMergeTolerance`：半空间包含判断的数值容差。
 
-Corridors are ordered oriented convex boxes represented as `A*x <= b`. Each is
-grown from its complete path segment and sampled conservatively against the
-hard map. If sparse-seed construction fails, the existing A* points are restored
-and corridor construction is retried without rerunning the global search.
+corridor 是按路径顺序排列的有向凸矩形，以 `A*x <= b` 表示。每个 corridor 从完整路径段开始生长，并通过硬占据地图进行保守采样。如果稀疏种子构造失败，规划器会恢复已有 A* 路径点后重试 corridor，而不会重新执行全局搜索。
 
-## MINCO trajectory
+## MINCO 轨迹
 
-- `NominalVel`: nominal speed used for initial segment durations.
-- `MaxVelMag`: deprecated compatibility alias for `NominalVel`.
-- `MaxPlanVel`, `MaxPlanAcc`: planning-envelope speed and acceleration limits.
-- `MinSegmentDuration`: lower duration bound for numerical stability.
-- `WeightTime`, `WeightVelPenalty`, `WeightAccPenalty`: backend objective weights.
-- `OptimizationMaxIterations`, `OptimizationTimeBudgetMs`: projected-search bounds.
+- `NominalVel`：计算初始分段时长使用的标称速度。
+- `MaxVelMag`：为兼容旧配置保留的 `NominalVel` 别名，已不推荐使用。
+- `MaxPlanVel`、`MaxPlanAcc`：规划速度和加速度包络上限。
+- `MinSegmentDuration`：避免数值不稳定的最短分段时长。
+- `WeightTime`、`WeightVelPenalty`、`WeightAccPenalty`：后端目标函数的时间、速度和加速度权重。
+- `OptimizationMaxIterations`、`OptimizationTimeBudgetMs`：投影搜索的迭代次数与时间预算。
 
-The backend keeps `MINCO_S3NU`, adjusts intermediate points only inside the
-ordered adjacent-corridor overlap, and applies positive time scaling to meet the
-planning envelope. A result is rejected if sampled pieces leave their assigned
-corridor, collide, contain invalid data, or exceed the envelope.
+后端继续使用 `MINCO_S3NU`。中间点只能在相邻且顺序固定的 corridor 重叠区域内调整，分段时长保持为正，并通过时间缩放满足规划包络。如果采样轨迹离开对应 corridor、发生碰撞、包含非法数据或超过运动包络，该结果会被拒绝，不会发布。
 
-## Dynamic obstacles
+## 动态障碍物
 
-- `PredictionHorizonSec`: future trajectory/prediction window.
-- `DynamicSafetyMargin`: extra separation added to obstacle and robot radii.
-- `DynamicObstacleTimeoutSec`: maximum accepted observation age.
-- `ReplanCooldownMs`: minimum interval between accepted replans.
+- `PredictionHorizonSec`：未来轨迹与障碍物预测窗口。
+- `DynamicSafetyMargin`：叠加到障碍物和机器人半径上的额外安全距离。
+- `DynamicObstacleTimeoutSec`：动态障碍物观测允许的最大时间延迟。
+- `ReplanCooldownMs`：两次有效重规划之间的最短间隔。
 
-Each dynamic observation contains position, velocity, box size or circle radius,
-timestamp, shape, and validity duration. Only predicted conflicts with the active
-future trajectory trigger replanning. A failed replan retains the old trajectory
-only if the conflict check says it is still safe; otherwise the planner clears its
-active-plan state and emits an error for the controller/supervisor.
+每个动态障碍物观测包含位置、速度、矩形尺寸或圆形半径、时间戳、形状和有效时长。只有障碍物的预测运动与当前轨迹未来部分冲突时才触发重规划。重规划失败后，仅当旧轨迹仍安全时才保留旧轨迹；否则规划器会清除活动轨迹状态，并向控制器或上层监督节点报告错误。
 
-## Cross-hole timing
+## 狗洞时间区间
 
-- `CrossHoleShapeTime`: preparation time before actual entry.
-- `CrossHoleRecoveryTime`: recovery time after actual exit.
-- `CrossHoleTimeMargin`: additional time margin on both sides.
+- `CrossHoleShapeTime`：实际进入狗洞前的准备时间。
+- `CrossHoleRecoveryTime`：实际离开狗洞后的恢复时间。
+- `CrossHoleTimeMargin`：进入和离开两侧附加的时间余量。
 
-Intervals are extracted from actual continuous-trajectory samples inside the
-semantic region. Near passes do not create intervals, and stale intervals are
-cleared whenever a new trajectory is built.
+狗洞区间根据连续轨迹实际落入语义区域的采样点提取。仅从附近经过不会生成区间；每次生成新轨迹时都会清除旧区间。
 
-## Diagnostics and current limits
+## 诊断信息与当前限制
 
-Every successful plan logs A*, corridor, MINCO, and total runtime, discrete path
-length, trajectory duration, minimum clearance, maximum velocity, and maximum
-acceleration. The current corridor inflation is a bounded 2D FIRI-style oriented
-box implementation rather than a general maximum-volume polygon solver. Dynamic
-box collision prediction uses a conservative circumscribed radius. The existing
-external message set has no explicit stop command, so unsafe replan failure is
-exposed through the active-plan state and ROS error log; integration should map
-that condition to the robot controller's stop interface.
+每次成功规划都会记录 A*、corridor、MINCO 和总耗时，以及离散路径长度、连续轨迹时长、最小障碍物净空、最大速度和最大加速度。
+
+规划结果采用以下分级状态，并通过可靠、瞬态本地的 `/planner/status`（`std_msgs/msg/String`）发布。前端或稀疏后的标准路径通过 `/planner/path`（`nav_msgs/msg/Path`）发布：
+
+- `OPTIMIZED_MINCO`：完整优化轨迹，能够执行。
+- `SAFE_INITIAL_MINCO`：优化失败后使用的安全初始 MINCO，能够执行，但平滑性或时间代价不是最优。
+- `CORRIDOR_PATH_ONLY`：前端路径和 corridor 成功，连续轨迹不可安全执行。
+- `FRONTEND_PATH_ONLY`：仅前端硬膨胀地图路径成功，不可直接作为 MINCO 控制轨迹执行。
+- `FAILED_NO_PATH`：前端也未找到可行路径。
+- `PATH_ONLY_STOP_REQUIRED`：动态重规划只能得到离散路径，且旧轨迹已不安全，控制器必须停车。
+
+黄色前端路径会在 A* 完成后立即显示，不再等待后端全部结束。所有可执行降级轨迹仍必须通过数据、corridor、硬碰撞、速度和加速度检查；保底机制不会发布穿越硬障碍物的轨迹。
+
+当前 corridor 是有界的二维 FIRI 风格有向矩形膨胀，还不是通用的最大体积凸多边形求解器。动态矩形障碍物的碰撞预测使用保守外接圆。现有外部消息中没有明确的停车指令，因此危险状态下重规划失败会通过活动轨迹状态和 ROS 错误日志暴露；接入实体机器人时，应将此状态映射到控制器的停车接口。

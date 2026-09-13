@@ -11,9 +11,11 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <plan_interfaces/msg/minco_trajectory.hpp>
 #include <plan_interfaces/msg/dynamic_obstacle_array.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -171,6 +173,9 @@ public:
   void updateWaypointSpaciousFlags(MincoTrajectoryData & data) const;
   void extractCrossHoleIntervals(const Trajectory<5, 2> & trajectory,
     MincoTrajectoryData & data) const;
+  void publishPlanningPath(const std::vector<Eigen::Vector2d> & route);
+  void publishPlanningStatus(
+    const std::string & level, bool executable, const std::string & detail);
   void publishMincoTrajectory(const MincoTrajectoryData & data);
   bool fillTrajectoryOdom(const Trajectory<5, 2> & trajectory, double elapsed_time,
     nav_msgs::msg::Odometry & odom_message);
@@ -185,6 +190,8 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odomSub_;
   rclcpp::Subscription<plan_interfaces::msg::DynamicObstacleArray>::SharedPtr dynamicSub_;
   rclcpp::Publisher<plan_interfaces::msg::MincoTrajectory>::SharedPtr traj_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr planning_path_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr planning_status_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr trajectory_odom_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   GridMap2D grid_map_;

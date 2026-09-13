@@ -17,7 +17,8 @@
       RobotRadiusCompact: 0.15
       StaticSafetyMargin: 0.05
 
-      TurnCostWeight: 0.0
+      # Initial scale ~= 1.1 * NominalVel^2 / MaxPlanAcc.
+      TurnCostWeight: 0.18
       SafetyCostWeight: 0.0
       SafetyCostDistance: 0.50
       SpecialRegionCostWeight: 0.0

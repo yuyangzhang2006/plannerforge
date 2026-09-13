@@ -35,12 +35,22 @@ struct OptimizationOptions
   double time_budget_ms = 20.0;
 };
 
+// 仅通过统一延长时间，将初始 MINCO 轨迹变为满足硬安全与运动包络的保底轨迹。
+// 不移动路径点，也不执行目标函数优化。
+bool PrepareSafeInitialTrajectory(
+  const GridMap2D & map,
+  const MincoTrajectoryData & input,
+  const OptimizationOptions & options,
+  MincoTrajectoryData & output,
+  std::string * failure_reason = nullptr);
+
 // 优化轨迹位置、时间和约束，结果写入 output。
 bool OptimizeTrajectory(
   const GridMap2D & map,
   const MincoTrajectoryData & input,
   const OptimizationOptions & options,
-  MincoTrajectoryData & output);
+  MincoTrajectoryData & output,
+  std::string * failure_reason = nullptr);
 
 // 检查轨迹字段的尺寸、数值和时间区间。
 bool ValidateTrajectoryData(
