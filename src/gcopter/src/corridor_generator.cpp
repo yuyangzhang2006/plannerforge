@@ -1,11 +1,112 @@
 #include "gcopter/corridor_generator.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
 namespace
 {
+
+struct LocalObstacleSet
+{
+  const GridMap2D & map;
+  Eigen::Vector2d start;
+  Eigen::Vector2d end;
+  Eigen::Vector2d direction;
+  Eigen::Vector2d normal;
+  double length = 0.0;
+  std::vector<Eigen::Vector2d> occupied_centers;
+
+  LocalObstacleSet(
+    const GridMap2D & input_map, const Eigen::Vector2d & input_start,
+    const Eigen::Vector2d & input_end, double search_radius)
+  : map(input_map), start(input_start), end(input_end),
+    direction((input_end - input_start).normalized()),
+    normal(-direction.y(), direction.x()), length((input_end - input_start).norm())
+  {
+    // 所有候选 corridor 都包含在 seed 两端与 search_radius 构成的包围盒内。
+    // 这里只扫描一次局部栅格，后续几十次扩张测试只访问其中的障碍格。
+    const double padding = std::sqrt(2.0) * search_radius + map.resolution;
+    const Eigen::Vector2d lower = start.cwiseMin(end) - Eigen::Vector2d::Constant(padding);
+    const Eigen::Vector2d upper = start.cwiseMax(end) + Eigen::Vector2d::Constant(padding);
+    Eigen::Vector2i minimum = map.worldToGrid(lower);
+    Eigen::Vector2i maximum = map.worldToGrid(upper);
+    minimum.x() = std::clamp(minimum.x(), 0, map.width - 1);
+    minimum.y() = std::clamp(minimum.y(), 0, map.height - 1);
+    maximum.x() = std::clamp(maximum.x(), 0, map.width - 1);
+    maximum.y() = std::clamp(maximum.y(), 0, map.height - 1);
+    for (int y = minimum.y(); y <= maximum.y(); ++y) {
+      for (int x = minimum.x(); x <= maximum.x(); ++x) {
+        const Eigen::Vector2i cell(x, y);
+        if (map.isOccupied(cell)) {occupied_centers.push_back(map.gridToWorld(cell));}
+      }
+    }
+  }
+
+  bool isFree(
+    double forward_extension, double backward_extension,
+    double left_width, double right_width) const
+  {
+    const double along_min = direction.dot(start) - backward_extension;
+    const double along_max = direction.dot(start) + length + forward_extension;
+    const double lateral_origin = normal.dot(start);
+    const double lateral_min = lateral_origin - right_width;
+    const double lateral_max = lateral_origin + left_width;
+    const std::array<Eigen::Vector2d, 4> corners = {
+      start - direction * backward_extension - normal * right_width,
+      start - direction * backward_extension + normal * left_width,
+      end + direction * forward_extension - normal * right_width,
+      end + direction * forward_extension + normal * left_width};
+    const double map_min_x = map.origin.x();
+    const double map_min_y = map.origin.y();
+    const double map_max_x = map_min_x + static_cast<double>(map.width) * map.resolution;
+    const double map_max_y = map_min_y + static_cast<double>(map.height) * map.resolution;
+    for (const Eigen::Vector2d & corner : corners) {
+      if (corner.x() < map_min_x || corner.x() > map_max_x ||
+        corner.y() < map_min_y || corner.y() > map_max_y)
+      {
+        return false;
+      }
+    }
+
+    double box_min_x = corners[0].x();
+    double box_max_x = corners[0].x();
+    double box_min_y = corners[0].y();
+    double box_max_y = corners[0].y();
+    for (size_t index = 1; index < corners.size(); ++index) {
+      box_min_x = std::min(box_min_x, corners[index].x());
+      box_max_x = std::max(box_max_x, corners[index].x());
+      box_min_y = std::min(box_min_y, corners[index].y());
+      box_max_y = std::max(box_max_y, corners[index].y());
+    }
+    const double half = 0.5 * map.resolution;
+    const double along_radius = half * (std::abs(direction.x()) + std::abs(direction.y()));
+    const double lateral_radius = half * (std::abs(normal.x()) + std::abs(normal.y()));
+    for (const Eigen::Vector2d & center : occupied_centers) {
+      // AABB 两个轴的快速排除。
+      if (center.x() + half < box_min_x || center.x() - half > box_max_x ||
+        center.y() + half < box_min_y || center.y() - half > box_max_y)
+      {
+        continue;
+      }
+      // 另外两个分离轴是 corridor 自身的纵向和横向轴。四轴均重叠时，
+      // 有向 corridor 与占据栅格方块相交。
+      const double cell_along = direction.dot(center);
+      if (cell_along + along_radius < along_min || cell_along - along_radius > along_max) {
+        continue;
+      }
+      const double cell_lateral = normal.dot(center);
+      if (cell_lateral + lateral_radius < lateral_min ||
+        cell_lateral - lateral_radius > lateral_max)
+      {
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+};
 
 ConvexCorridor2D makeBox(
   const Eigen::Vector2d & start, const Eigen::Vector2d & end,
@@ -26,34 +127,6 @@ ConvexCorridor2D makeBox(
   result.b(2) = normal.dot(start) + left_width;
   result.b(3) = -normal.dot(start) + right_width;
   return result;
-}
-
-bool boxIsFree(
-  const GridMap2D & map, const Eigen::Vector2d & start, const Eigen::Vector2d & end,
-  double forward_extension, double backward_extension,
-  double left_width, double right_width)
-{
-  const double length = (end - start).norm();
-  const Eigen::Vector2d direction = (end - start) / length;
-  const Eigen::Vector2d normal(-direction.y(), direction.x());
-  const double spacing = std::max(0.5 * map.resolution, 1.0e-3);
-  const double longitudinal_span = length + forward_extension + backward_extension;
-  const double lateral_span = left_width + right_width;
-  const int longitudinal = std::max(
-    1, static_cast<int>(std::ceil(longitudinal_span / spacing)));
-  const int lateral = std::max(1, static_cast<int>(std::ceil(lateral_span / spacing)));
-  for (int i = 0; i <= longitudinal; ++i) {
-    const double along = -backward_extension + longitudinal_span *
-      static_cast<double>(i) / static_cast<double>(longitudinal);
-    for (int j = 0; j <= lateral; ++j) {
-      const double across = -right_width + lateral_span *
-        static_cast<double>(j) / static_cast<double>(lateral);
-      if (map.isOccupied(map.worldToGrid(start + direction * along + normal * across))) {
-        return false;
-      }
-    }
-  }
-  return true;
 }
 
 std::vector<Eigen::Vector2d> clipPolygon(
@@ -161,21 +234,20 @@ bool GenerateCorridor(
     double backward_extension = 0.0;
     double left_width = initial_width;
     double right_width = initial_width;
-    if (!boxIsFree(
-        map, start, end, 0.0, 0.0, left_width, right_width))
+    const LocalObstacleSet local_obstacles(
+      map, start, end, options.obstacle_search_radius);
+    if (!local_obstacles.isFree(0.0, 0.0, left_width, right_width))
     {
       reason = "seed_not_free";
       return false;
     }
-    if (boxIsFree(
-        map, start, end, initial_extension, backward_extension,
-        left_width, right_width))
+    if (local_obstacles.isFree(
+        initial_extension, backward_extension, left_width, right_width))
     {
       forward_extension = initial_extension;
     }
-    if (boxIsFree(
-        map, start, end, forward_extension, initial_extension,
-        left_width, right_width))
+    if (local_obstacles.isFree(
+        forward_extension, initial_extension, left_width, right_width))
     {
       backward_extension = initial_extension;
     }
@@ -183,34 +255,30 @@ bool GenerateCorridor(
       const double proposed_left = std::min(
         options.obstacle_search_radius,
         std::max(left_width * 2.0, left_width + map.resolution));
-      if (boxIsFree(
-          map, start, end, forward_extension, backward_extension,
-          proposed_left, right_width))
+      if (local_obstacles.isFree(
+          forward_extension, backward_extension, proposed_left, right_width))
       {
         left_width = proposed_left;
       }
       const double proposed_right = std::min(
         options.obstacle_search_radius,
         std::max(right_width * 2.0, right_width + map.resolution));
-      if (boxIsFree(
-          map, start, end, forward_extension, backward_extension,
-          left_width, proposed_right))
+      if (local_obstacles.isFree(
+          forward_extension, backward_extension, left_width, proposed_right))
       {
         right_width = proposed_right;
       }
       const double proposed_forward = std::min(
         options.obstacle_search_radius, forward_extension + map.resolution);
-      if (boxIsFree(
-          map, start, end, proposed_forward, backward_extension,
-          left_width, right_width))
+      if (local_obstacles.isFree(
+          proposed_forward, backward_extension, left_width, right_width))
       {
         forward_extension = proposed_forward;
       }
       const double proposed_backward = std::min(
         options.obstacle_search_radius, backward_extension + map.resolution);
-      if (boxIsFree(
-          map, start, end, forward_extension, proposed_backward,
-          left_width, right_width))
+      if (local_obstacles.isFree(
+          forward_extension, proposed_backward, left_width, right_width))
       {
         backward_extension = proposed_backward;
       }
@@ -227,20 +295,18 @@ bool GenerateCorridor(
         value = lower;
       };
     refine_extent(left_width, [&](double candidate) {
-      return boxIsFree(map, start, end, forward_extension, backward_extension,
-        candidate, right_width);
+      return local_obstacles.isFree(
+        forward_extension, backward_extension, candidate, right_width);
     });
     refine_extent(right_width, [&](double candidate) {
-      return boxIsFree(map, start, end, forward_extension, backward_extension,
-        left_width, candidate);
+      return local_obstacles.isFree(
+        forward_extension, backward_extension, left_width, candidate);
     });
     refine_extent(forward_extension, [&](double candidate) {
-      return boxIsFree(map, start, end, candidate, backward_extension,
-        left_width, right_width);
+      return local_obstacles.isFree(candidate, backward_extension, left_width, right_width);
     });
     refine_extent(backward_extension, [&](double candidate) {
-      return boxIsFree(map, start, end, forward_extension, candidate,
-        left_width, right_width);
+      return local_obstacles.isFree(forward_extension, candidate, left_width, right_width);
     });
     ConvexCorridor2D corridor = makeBox(
       start, end, forward_extension, backward_extension, left_width, right_width);

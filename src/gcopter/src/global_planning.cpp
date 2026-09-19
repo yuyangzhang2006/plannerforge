@@ -238,6 +238,7 @@ void GlobalPlanner::mapCallBack(const nav_msgs::msg::OccupancyGrid::SharedPtr ms
 
   const bool first_map = !mapInitialized_;
   grid_map_ = std::move(candidate);
+  path_search_.prepare(grid_map_.cellCount());
   mapInitialized_ = true;
   map_changed_ = true;
   if (first_map) {

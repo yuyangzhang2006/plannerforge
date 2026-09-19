@@ -91,6 +91,29 @@ TEST(PathSearch, CrossHolePenaltySelectsNormalAlternative)
   }));
 }
 
+TEST(PathSearch, ReusesPreparedStateWithoutLeakingPreviousSearch)
+{
+  GridMap2D map = makeMap(30, 20, 0.1);
+  for (int y = 2; y < 18; ++y) {
+    if (y != 10) {map.raw_occupancy[static_cast<size_t>(map.index({15, y}))] = 100U;}
+  }
+  rebuild(map);
+  PathSearch search;
+  search.prepare(map.cellCount());
+  std::vector<Eigen::Vector2d> first;
+  std::vector<Eigen::Vector2d> second;
+  ASSERT_TRUE(search.search(
+    map, map.gridToWorld({2, 3}), map.gridToWorld({27, 16}), true,
+    searchOptions(), first));
+  ASSERT_TRUE(search.search(
+    map, map.gridToWorld({2, 16}), map.gridToWorld({27, 3}), true,
+    searchOptions(), second));
+  EXPECT_TRUE(first.front().isApprox(map.gridToWorld({2, 3})));
+  EXPECT_TRUE(first.back().isApprox(map.gridToWorld({27, 16})));
+  EXPECT_TRUE(second.front().isApprox(map.gridToWorld({2, 16})));
+  EXPECT_TRUE(second.back().isApprox(map.gridToWorld({27, 3})));
+}
+
 TEST(SamplePath, PreservesTurnsAndSemanticBoundaries)
 {
   GridMap2D map = makeMap(10, 10, 0.1);

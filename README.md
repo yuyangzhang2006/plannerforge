@@ -31,9 +31,12 @@ PlannerForge/
 cd PlannerForge
 source /opt/ros/jazzy/setup.bash
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --base-paths src --symlink-install
+colcon build --base-paths src --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
+
+比赛运行和性能测试必须使用 `Release` 构建。`gcopter` 在未显式指定构建类型时
+也会默认选择 `Release`；需要调试符号时可主动传入 `-DCMAKE_BUILD_TYPE=Debug`。
 
 ## 启动
 

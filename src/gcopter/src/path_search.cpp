@@ -4,8 +4,21 @@
 #include <array>
 #include <cmath>
 #include <limits>
-#include <queue>
 #include <vector>
+
+void PathSearch::prepare(std::size_t cell_count)
+{
+  constexpr size_t kDirectionStates = 9U;
+  if (cell_count > std::numeric_limits<size_t>::max() / kDirectionStates) {return;}
+  const size_t state_count = cell_count * kDirectionStates;
+  if (nodes_.size() != state_count) {
+    nodes_.clear();
+    nodes_.resize(state_count);
+    generation_ = 0U;
+  }
+  open_heap_.clear();
+  open_heap_.reserve(std::min(state_count, cell_count * 2U));
+}
 
 bool PathSearch::search(
   const GridMap2D & map,
@@ -79,36 +92,99 @@ bool PathSearch::search(
              (std::sqrt(2.0) - 1.0) * static_cast<double>(std::min(dx, dy)));
     };
 
-  struct QueueNode {double f; double g; int state;};
-  const auto compare = [](const QueueNode & lhs, const QueueNode & rhs) {
-      if (lhs.f != rhs.f) {return lhs.f > rhs.f;}
-      if (lhs.g != rhs.g) {return lhs.g > rhs.g;}
-      return lhs.state > rhs.state;
-    };
   const size_t state_count = map.cellCount() * kDirectionStates;
-  std::vector<double> best(state_count, std::numeric_limits<double>::infinity());
-  std::vector<int> parent(state_count, -1);
-  std::vector<uint8_t> closed(state_count, 0U);
-  std::priority_queue<QueueNode, std::vector<QueueNode>, decltype(compare)> open(compare);
+  if (nodes_.size() != state_count) {
+    prepare(map.cellCount());
+  }
+  if (++generation_ == 0U) {
+    for (SearchNode & node : nodes_) {node.generation = 0U;}
+    generation_ = 1U;
+  }
+  open_heap_.clear();
+
+  const auto lessState = [&](int lhs, int rhs) {
+      const SearchNode & a = nodes_[static_cast<size_t>(lhs)];
+      const SearchNode & b = nodes_[static_cast<size_t>(rhs)];
+      if (a.f != b.f) {return a.f < b.f;}
+      if (a.g != b.g) {return a.g < b.g;}
+      return lhs < rhs;
+    };
+  const auto swapHeap = [&](int lhs, int rhs) {
+      std::swap(open_heap_[static_cast<size_t>(lhs)], open_heap_[static_cast<size_t>(rhs)]);
+      nodes_[static_cast<size_t>(open_heap_[static_cast<size_t>(lhs)])].heap_index = lhs;
+      nodes_[static_cast<size_t>(open_heap_[static_cast<size_t>(rhs)])].heap_index = rhs;
+    };
+  const auto siftUp = [&](int initial) {
+      int index = initial;
+      while (index > 0) {
+        const int parent_index = (index - 1) / 2;
+        if (!lessState(open_heap_[static_cast<size_t>(index)],
+            open_heap_[static_cast<size_t>(parent_index)])) {break;}
+        swapHeap(index, parent_index);
+        index = parent_index;
+      }
+    };
+  const auto pushOrDecrease = [&](int state) {
+      SearchNode & node = nodes_[static_cast<size_t>(state)];
+      if (node.heap_index < 0) {
+        node.heap_index = static_cast<int>(open_heap_.size());
+        open_heap_.push_back(state);
+      }
+      siftUp(node.heap_index);
+    };
+  const auto popMinimum = [&]() {
+      const int result = open_heap_.front();
+      swapHeap(0, static_cast<int>(open_heap_.size()) - 1);
+      open_heap_.pop_back();
+      nodes_[static_cast<size_t>(result)].heap_index = -1;
+      int index = 0;
+      while (true) {
+        const int left = 2 * index + 1;
+        if (left >= static_cast<int>(open_heap_.size())) {break;}
+        const int right = left + 1;
+        int smallest = left;
+        if (right < static_cast<int>(open_heap_.size()) &&
+          lessState(open_heap_[static_cast<size_t>(right)],
+          open_heap_[static_cast<size_t>(left)]))
+        {
+          smallest = right;
+        }
+        if (!lessState(open_heap_[static_cast<size_t>(smallest)],
+            open_heap_[static_cast<size_t>(index)])) {break;}
+        swapHeap(index, smallest);
+        index = smallest;
+      }
+      return result;
+    };
+
+  const auto initializeNode = [&](int state) -> SearchNode & {
+      SearchNode & node = nodes_[static_cast<size_t>(state)];
+      if (node.generation != generation_) {
+        node.generation = generation_;
+        node.g = std::numeric_limits<double>::infinity();
+        node.f = std::numeric_limits<double>::infinity();
+        node.parent = -1;
+        node.heap_index = -1;
+        node.closed = false;
+      }
+      return node;
+    };
 
   const int start_state = stateIndex(map.index(start_grid), kStartDirection);
-  best[static_cast<size_t>(start_state)] = 0.0;
-  open.push({octile(start_grid), 0.0, start_state});
+  SearchNode & start_node = initializeNode(start_state);
+  start_node.g = 0.0;
+  start_node.f = octile(start_grid);
+  pushOrDecrease(start_state);
   int goal_state = -1;
 
-  while (!open.empty()) {
-    const QueueNode current = open.top();
-    open.pop();
-    if (closed[static_cast<size_t>(current.state)] != 0U ||
-      current.g > best[static_cast<size_t>(current.state)] + 1.0e-12)
-    {
-      continue;
-    }
-    closed[static_cast<size_t>(current.state)] = 1U;
-    const int current_cell = current.state / kDirectionStates;
-    const int incoming = current.state % kDirectionStates;
+  while (!open_heap_.empty()) {
+    const int current_state = popMinimum();
+    SearchNode & current = nodes_[static_cast<size_t>(current_state)];
+    current.closed = true;
+    const int current_cell = current_state / kDirectionStates;
+    const int incoming = current_state % kDirectionStates;
     if (current_cell == map.index(goal_grid)) {
-      goal_state = current.state;
+      goal_state = current_state;
       break;
     }
     const Eigen::Vector2i current_grid(current_cell % map.width, current_cell / map.width);
@@ -144,10 +220,12 @@ bool PathSearch::search(
         options.special_region_cost_weight * length : 0.0;
       const double next_g = current.g + length + turn + safety + semantic;
       const int next_state = stateIndex(map.index(next_grid), direction);
-      if (next_g + 1.0e-12 < best[static_cast<size_t>(next_state)]) {
-        best[static_cast<size_t>(next_state)] = next_g;
-        parent[static_cast<size_t>(next_state)] = current.state;
-        open.push({next_g + octile(next_grid), next_g, next_state});
+      SearchNode & next = initializeNode(next_state);
+      if (!next.closed && next_g + 1.0e-12 < next.g) {
+        next.g = next_g;
+        next.f = next_g + octile(next_grid);
+        next.parent = current_state;
+        pushOrDecrease(next_state);
       }
     }
   }
@@ -157,7 +235,9 @@ bool PathSearch::search(
   }
 
   std::vector<int> reverse_cells;
-  for (int state = goal_state; state >= 0; state = parent[static_cast<size_t>(state)]) {
+  for (int state = goal_state; state >= 0;
+    state = nodes_[static_cast<size_t>(state)].parent)
+  {
     reverse_cells.push_back(state / kDirectionStates);
     if (state == start_state) {break;}
     if (reverse_cells.size() > state_count) {
